@@ -55,12 +55,15 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import functools
 import json
 import sys
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
 
+from bot.alerts import check_funding, funding_wallets
+from bot.config import alert_mail_settings
 from bot.forecast import (
     DATA_DIR,
     POLL_LOG,
@@ -142,6 +145,7 @@ def poll(
     dry_run: bool = False,
     max_sweeps: int | None = None,
     wait_at_floor: bool = False,
+    alert: Callable[[dict[str, float | None]], list[str]] | None = None,
     now: Callable[[], dt.datetime] | None = None,
     sleep: Callable[[float], None] | None = None,
 ) -> PollOutcome:
@@ -182,6 +186,12 @@ def poll(
 
         tick_started = now()
         credit = session.credits_remaining()
+        if alert is not None:
+            # Every tick, parked or not: parked is exactly when the owner must hear.
+            balances = {"donated": credit, "personal": session.personal_credits_remaining()}
+            for subject in alert(balances):
+                print(f"alert emailed: {subject}")
+                append_jsonl(POLL_LOG, row(credits_remaining=credit, alert=subject))
         cap = affordable_questions(credit, min_credit, cost_per_question)
         if cap is not None and cap < 1:
             floor = min_credit + cost_per_question
@@ -319,6 +329,7 @@ def main(argv: list[str] | None = None) -> int:
             dry_run=args.dry_run,
             max_sweeps=args.max_sweeps,
             wait_at_floor=args.wait_at_floor,
+            alert=mail_alerter(args.min_credit, args.cost_per_question),
         )
     except KeyboardInterrupt:
         print("\ninterrupted — stopping after the current sweep.")
@@ -331,6 +342,30 @@ def main(argv: list[str] | None = None) -> int:
         f"{outcome.sweeps} sweep(s), {outcome.submitted} forecast(s) submitted."
     )
     return 0
+
+
+def mail_alerter(
+    min_credit: float, cost_per_question: float
+) -> Callable[[dict[str, float | None]], list[str]] | None:
+    """The funding-alert hook for poll(), or None, said out loud, when mail is not set up.
+
+    Built from the same floor and rate the loop uses, so "empty" in the email is
+    exactly "parked" in the loop.
+    """
+    settings = alert_mail_settings()
+    if settings is None:
+        print("note: ALERT_SMTP_USER / ALERT_SMTP_PASSWORD absent — funding alerts are OFF.")
+        return None
+    from bot.venues.mail import send_mail
+
+    wallets = funding_wallets(min_credit, cost_per_question)
+    send = functools.partial(send_mail, settings)
+
+    def alert(balances: dict[str, float | None]) -> list[str]:
+        return check_funding(balances, wallets, send)
+
+    print(f"funding alerts ON: mail to {settings.to} on each change of level.")
+    return alert
 
 
 if __name__ == "__main__":

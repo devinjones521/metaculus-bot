@@ -13,9 +13,9 @@ about three hours each.
 
 ```
 research ──► 5 independent forecasts ──► median ──► tail caps ──► CDF built in code ──► submit + comment
-(web search)   (Anthropic, OpenAI,        (one bad    (no 0.1% on    (numeric/discrete)
-               Google; two samples each    run can't   a live
-               of the first two)           move it)    question)
+(web search)   (Claude ×2, GPT, Gemini,   (one bad    (no 0.1% on    (numeric/discrete)
+               Grok: four families)       run can't   a live
+                                          move it)    question)
 ```
 
 Every design choice is backed by an effect size measured in Metaculus's own published analyses
@@ -40,14 +40,29 @@ questions. `bot/poll.py` exists to fix that.
 
 ```
 uv sync
-cp .env.example .env         # METACULUS_TOKEN, OPENROUTER_API_KEY (ASKNEWS_* optional)
+cp .env.example .env         # METACULUS_TOKEN, OPENROUTER_API_KEY; the rest optional
 uv run python -m bot.verify                                   # lint, types, tests, invariants
 uv run python -m bot.forecast --tournament bot-testing-area   # rehearse (resubmission allowed)
 uv run python -m bot.poll --tournament minibench --until 2026-10-05T00:00Z
+uv run python -m bot.alerts --status                          # both keys' balances and levels
 ```
 
 `bot-testing-area` is the only place to rehearse. Tournaments expect one forecast per question,
 and the code refuses `--resubmit` anywhere else.
+
+### Two keys
+
+Metaculus's donated OpenRouter keys allow only OpenAI, Anthropic and Google models. The Grok
+run therefore goes to `OPENROUTER_PERSONAL_KEY`, your own key; everything else, research
+included, stays on the donated one. Without a personal key, Grok is dropped from the roster at
+startup and the ensemble runs on four models.
+
+### Funding alerts
+
+With `ALERT_SMTP_USER` and `ALERT_SMTP_PASSWORD` (a Gmail app password) set, the poller emails
+you when either key runs low, runs out, or is topped up: once per change, not once per tick.
+The donated key's "empty" is exactly the point at which the poller parks and stops forecasting.
+`uv run python -m bot.alerts --test` sends one test email.
 
 ## Invariants (`bot.verify`, one exit code)
 
@@ -55,6 +70,7 @@ and the code refuses `--resubmit` anywhere else.
 2. No skipped tests.
 3. No credential in any file git would publish. The check covers both the shape of known key
    formats and the literal values in the local `.env`.
+4. Every deployed poller has a liveness contract in `bot.health`, and vice versa.
 
 ## License
 

@@ -67,6 +67,7 @@ from bot.config import (
     load_dotenv,
     metaculus_token,
     openrouter_key,
+    openrouter_personal_key,
 )
 from bot.elicit import (
     ParseError,
@@ -100,16 +101,21 @@ FORECAST_LOG = DATA_DIR / "forecasts.jsonl"
 POLL_LOG = DATA_DIR / "polls.jsonl"
 
 # The ensemble roster. Diversity across model families is the evidenced shape
-# (Mantic's 4-family ensemble; nostreambot's decorrelation member). Overridable
-# via METAC_FORECAST_MODELS / METAC_RESEARCH_MODEL without a code change, and
-# validated against the live OpenRouter id list at startup so a typo fails
-# before question one, not during question five.
+# (Mantic's 4-family ensemble; nostreambot's decorrelation member). This is the
+# 2026-08-24 roster that scored +23.9/q (n=10, se 7.3) with one substitution:
+# Gemini 3.1 Pro 429'd on the donated key from 2026-09-10, and 3.8 Flash took
+# its slot (evidence in docs/METHOD.md). Fable is sampled twice on purpose, and
+# first, because the extremeness check runs on models[0]. Grok needs
+# OPENROUTER_PERSONAL_KEY (see PERSONAL_KEY_PROVIDERS) and is dropped without it.
+# Overridable via METAC_FORECAST_MODELS / METAC_RESEARCH_MODEL without a code
+# change, and validated against the live OpenRouter id list at startup so a
+# typo fails before question one, not during question five.
 DEFAULT_FORECAST_MODELS = (
     "anthropic/claude-fable-5",
     "anthropic/claude-fable-5",
     "openai/gpt-5.5",
-    "openai/gpt-5.5",
-    "google/gemini-3.1-pro-preview",
+    "google/gemini-3.8-flash",
+    "x-ai/grok-4.6",
 )
 DEFAULT_RESEARCH_MODEL = "anthropic/claude-sonnet-5:online"
 
@@ -425,6 +431,32 @@ class SetupError(RuntimeError):
     """Configuration is missing or wrong. Carries the operator-facing message."""
 
 
+# Providers the donated key's OpenRouter account refuses, so their models run on
+# the owner's own key. Measured 2026-09-10: x-ai/grok-4.6 returned HTTP 404,
+# "your account's allowed-providers setting permits only: openai, anthropic,
+# google-ai-studio". That setting is Metaculus's, not ours to change.
+PERSONAL_KEY_PROVIDERS = ("x-ai/",)
+
+
+def needs_personal_key(model: str) -> bool:
+    return model.startswith(PERSONAL_KEY_PROVIDERS)
+
+
+def _balance(llm_client: Any) -> float | None:
+    """Dollars left on one OpenRouter key, or None if the key won't say.
+
+    None means UNKNOWN, and every caller must treat it as such. Returning
+    0.0 on a failed lookup would stop the poller dead on a transient
+    network blip; returning a large number would let it spend into a wall.
+    """
+    try:
+        limits = llm_client.key_limits()
+    except Exception:  # noqa: BLE001 - an unreadable balance is not a fatal one
+        return None
+    value = limits.get("limit_remaining")
+    return float(value) if isinstance(value, int | float) else None
+
+
 @dataclass
 class Session:
     """Everything a sweep needs, built once.
@@ -442,23 +474,22 @@ class Session:
     research_model: str
     asknews_search: Callable[[str], list[Any] | None] | None
     metaculus_client: Any
+    # The owner's own key, for PERSONAL_KEY_PROVIDERS. None when it is not set.
+    personal_llm_client: Any = None
 
     def credits_remaining(self) -> float | None:
-        """Dollars left on the OpenRouter key, or None if the key won't say.
+        """Dollars left on the donated key, which pays for research and most runs."""
+        return _balance(self.llm_client)
 
-        None means UNKNOWN, and every caller must treat it as such. Returning
-        0.0 on a failed lookup would stop the poller dead on a transient
-        network blip; returning a large number would let it spend into a wall.
-        """
-        try:
-            limits = self.llm_client.key_limits()
-        except Exception:  # noqa: BLE001 - an unreadable balance is not a fatal one
-            return None
-        value = limits.get("limit_remaining")
-        return float(value) if isinstance(value, int | float) else None
+    def personal_credits_remaining(self) -> float | None:
+        """Dollars left on the personal key; None if there is none or it won't say."""
+        return None if self.personal_llm_client is None else _balance(self.personal_llm_client)
+
+    def llm_clients(self) -> list[Any]:
+        return [c for c in (self.llm_client, self.personal_llm_client) if c is not None]
 
     def close(self) -> None:
-        for closable in (self.llm_client, self.metaculus_client):
+        for closable in (*self.llm_clients(), self.metaculus_client):
             close = getattr(closable, "close", None)
             if close is not None:
                 close()
@@ -489,10 +520,35 @@ def build_session(*, dry_run: bool = False) -> Session:
             "Set METAC_FORECAST_MODELS / METAC_RESEARCH_MODEL in .env to valid ids."
         )
 
+    personal_key = openrouter_personal_key()
+    personal_client = OpenRouterClient(personal_key) if personal_key else None
+    if personal_client is None:
+        # Sent to the donated key, these runs would fail on every question: every
+        # ensemble thinned, and real failures buried under expected ones. Dropping
+        # them gives the same ensemble, said once at startup.
+        dropped = [m for m in models if needs_personal_key(m)]
+        models = tuple(m for m in models if not needs_personal_key(m))
+        if dropped:
+            print(
+                f"note: OPENROUTER_PERSONAL_KEY absent — {dropped} dropped from the roster; "
+                f"the ensemble runs {len(models)} model(s)."
+            )
+        if not models or needs_personal_key(research_model):
+            raise SetupError(
+                "this roster needs OPENROUTER_PERSONAL_KEY: the donated key refuses "
+                f"{', '.join(PERSONAL_KEY_PROVIDERS)} models."
+            )
+    on_personal = sorted({m for m in models if needs_personal_key(m)})
+    print(
+        f"roster: {', '.join(models)}"
+        + (f" ({', '.join(on_personal)} on the personal key)" if on_personal else "")
+    )
+
     def llm(model: str, prompt: str, *, temperature: float = 1.0) -> str:
         if model == "check":  # the extremeness check runs on the first roster model
             model = models[0]
-        return llm_client.complete(model, prompt, temperature=temperature)
+        route = personal_client if personal_client and needs_personal_key(model) else llm_client
+        return route.complete(model, prompt, temperature=temperature)
 
     asknews = None
     creds = asknews_credentials()
@@ -511,6 +567,7 @@ def build_session(*, dry_run: bool = False) -> Session:
         research_model=research_model,
         asknews_search=asknews,
         metaculus_client=live_client,
+        personal_llm_client=personal_client,
     )
 
 
@@ -521,6 +578,20 @@ class SweepSummary:
     failed: int
     cost_usd: float  # THIS sweep only — see sweep_and_log
     credits_remaining: float | None
+
+
+def _spend(session: Session) -> tuple[float, dict[str, float]]:
+    """Running cost across both keys' clients: the total, and per model.
+
+    The two clients never serve the same model, so merging per-model dicts
+    cannot double-count.
+    """
+    total = 0.0
+    by_model: dict[str, float] = {}
+    for llm_client in session.llm_clients():
+        total += float(getattr(llm_client, "total_cost_usd", 0.0))
+        by_model.update(dict(getattr(llm_client, "cost_by_model", {})))
+    return total, by_model
 
 
 def sweep_and_log(
@@ -541,8 +612,7 @@ def sweep_and_log(
     to make impossible to miss.
     """
     started = dt.datetime.now(dt.UTC).isoformat()
-    cost_before = float(getattr(session.llm_client, "total_cost_usd", 0.0))
-    by_model_before = dict(getattr(session.llm_client, "cost_by_model", {}))
+    cost_before, by_model_before = _spend(session)
 
     results = run_tournament(
         tournament,
@@ -580,9 +650,8 @@ def sweep_and_log(
         if result.submitted or (result.error and not result.error.startswith("skipped")):
             append_jsonl(FORECAST_LOG, row)
 
-    cost_now = float(getattr(session.llm_client, "total_cost_usd", 0.0))
+    cost_now, by_model_now = _spend(session)
     sweep_cost = cost_now - cost_before
-    by_model_now = dict(getattr(session.llm_client, "cost_by_model", {}))
     sweep_by_model = {
         model: round(cost - by_model_before.get(model, 0.0), 4)
         for model, cost in by_model_now.items()
@@ -599,6 +668,7 @@ def sweep_and_log(
             "failed": len(failed),
             "dry_run": dry_run,
             "credits_remaining": remaining,
+            "personal_credits_remaining": session.personal_credits_remaining(),
             "llm_cost_usd": round(sweep_cost, 4),
             "llm_cost_cumulative_usd": round(cost_now, 4),
             "llm_cost_by_model": sweep_by_model,

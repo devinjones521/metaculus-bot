@@ -22,3 +22,5 @@ secrets/
 # make every deploy a merge conflict and the file would be stale on arrival.
 data/metaculus/heartbeat-*.json
 data/metaculus/*.tmp
+# The level each funding alert last mailed. Box-local memory, same reasoning.
+data/metaculus/alerts.json

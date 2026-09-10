@@ -34,20 +34,33 @@ def _no_writes_to_real_data(tmp_path: Any, monkeypatch: Any) -> None:
     Found 2026-09-10: once the loop gained a heartbeat, every older test that ran
     poll() wrote a fake-clock heartbeat into the repo's real data/metaculus/. A
     per-test patch is a thing the next test forgets; this is not.
+
+    The same goes for mail and keys: no test may reach a real mail server (a
+    false alarm is how an inbox learns to ignore the bot) or read the real
+    personal key from .env.
     """
     monkeypatch.setattr(bp, "HEARTBEAT_DIR", tmp_path)
     monkeypatch.setattr(bp, "POLL_LOG", tmp_path / "polls.jsonl")
+    monkeypatch.setattr(bp, "alert_mail_settings", lambda: None)
+    monkeypatch.setattr("bot.alerts.STATE_PATH", tmp_path / "alerts.json")
+    monkeypatch.setattr("bot.forecast.openrouter_personal_key", lambda: None)
 
 
 class FakeSession:
-    """Only what poll() touches: a balance and something to hand to a sweep."""
+    """Only what poll() touches: balances and something to hand to a sweep."""
 
-    def __init__(self, credits: list[float | None] | float | None = 100.0) -> None:
+    def __init__(
+        self, credits: list[float | None] | float | None = 100.0, personal: float | None = None
+    ) -> None:
         self._credits = credits if isinstance(credits, list) else [credits]
+        self.personal = personal
         self.closed = False
 
     def credits_remaining(self) -> float | None:
         return self._credits[0] if len(self._credits) == 1 else self._credits.pop(0)
+
+    def personal_credits_remaining(self) -> float | None:
+        return self.personal
 
     def close(self) -> None:
         self.closed = True
@@ -405,3 +418,106 @@ def test_main_runs_the_real_loop_and_logs_every_sweep(
     assert polls[1]["llm_cost_usd"] == 0.0
     assert polls[1]["llm_cost_cumulative_usd"] == polls[0]["llm_cost_cumulative_usd"]
     assert "sweep limit reached" in capsys.readouterr().out
+
+
+# ------------------------------------------------------------ funding alerts
+#
+# 2026-09-10: the owner means to run the whole season on donated credit. A
+# poller parked at the floor forecasts nothing, and nothing outside the box
+# says so. These pin the email hook to the loop, parked ticks included.
+
+
+def test_the_alert_hook_sees_both_balances_every_tick_even_while_parked() -> None:
+    """Parked is exactly when the owner must hear, and parked ticks do not sweep."""
+    seen: list[dict[str, float | None]] = []
+
+    def alert(balances: dict[str, float | None]) -> list[str]:
+        seen.append(dict(balances))
+        return []
+
+    clock = FakeClock()
+    bp.poll(
+        FakeSession(credits=5.0, personal=0.5),
+        "minibench",
+        until=START + dt.timedelta(minutes=60),
+        interval_seconds=20 * 60,
+        wait_at_floor=True,
+        alert=alert,
+        now=clock,
+        sleep=clock.sleep,
+    )
+
+    assert seen == [{"donated": 5.0, "personal": 0.5}] * 3
+
+
+def test_a_sent_alert_leaves_a_row_in_the_poll_log(tmp_path: Any, monkeypatch: Any) -> None:
+    """A post-mortem must be able to see that the owner was told, and when."""
+    monkeypatch.setattr(bp, "sweep_and_log", lambda *a, **k: _summary())
+    clock = FakeClock()
+
+    bp.poll(
+        FakeSession(credits=30.0),
+        "minibench",
+        until=START + dt.timedelta(minutes=20),
+        interval_seconds=20 * 60,
+        alert=lambda balances: ["devinjones-bot: donated key LOW"],
+        now=clock,
+        sleep=clock.sleep,
+    )
+
+    assert [r.get("alert") for r in _rows(tmp_path / "polls.jsonl")] == [
+        "devinjones-bot: donated key LOW"
+    ]
+
+
+def test_six_parked_ticks_send_one_email_through_the_real_alerter(tmp_path: Any) -> None:
+    """End to end through poll(): real levels, a real state file, a fake mail server."""
+    from bot import alerts as ba
+
+    outbox: list[str] = []
+
+    def alert(balances: dict[str, float | None]) -> list[str]:
+        return ba.check_funding(
+            balances,
+            ba.funding_wallets(8.5, 1.15),
+            lambda subject, body: outbox.append(subject),
+            state_path=tmp_path / "alerts.json",
+        )
+
+    clock = FakeClock()
+    bp.poll(
+        FakeSession(credits=5.0),
+        "minibench",
+        until=START + dt.timedelta(hours=2),
+        interval_seconds=20 * 60,
+        wait_at_floor=True,
+        alert=alert,
+        now=clock,
+        sleep=clock.sleep,
+    )
+
+    assert len(outbox) == 1
+    assert "EMPTY" in outbox[0]
+
+
+def test_main_wires_alerts_only_when_mail_is_configured(monkeypatch: Any, capsys: Any) -> None:
+    """Parsed-and-never-forwarded is this project's most repeated wiring defect."""
+    from bot.config import MailSettings
+
+    seen: dict[str, Any] = {}
+
+    def fake_poll(session: Any, tournament: str, **kwargs: Any) -> Any:
+        seen.update(kwargs)
+        return bp.PollOutcome(0, 0, "deadline reached")
+
+    monkeypatch.setattr(bp, "build_session", lambda dry_run: FakeSession())
+    monkeypatch.setattr(bp, "poll", fake_poll)
+
+    assert bp.main(["--hours", "1"]) == 0
+    assert seen["alert"] is None
+    assert "funding alerts are OFF" in capsys.readouterr().out
+
+    settings = MailSettings(user="bot@example.com", password="fake", to="me@example.com")
+    monkeypatch.setattr(bp, "alert_mail_settings", lambda: settings)
+    assert bp.main(["--hours", "1"]) == 0
+    assert callable(seen["alert"])  # wired, and never called here: nothing is sent

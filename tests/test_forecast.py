@@ -310,6 +310,7 @@ def test_main_logs_dropped_run_reasons_and_announces_a_thinned_ensemble(
     monkeypatch.setenv("METAC_RESEARCH_MODEL", "model-r")
     monkeypatch.setattr(fc, "metaculus_token", lambda: "token")
     monkeypatch.setattr(fc, "openrouter_key", lambda: "key")
+    monkeypatch.setattr(fc, "openrouter_personal_key", lambda: None)
     monkeypatch.setattr(fc, "asknews_credentials", lambda: None)
     monkeypatch.setattr(fc, "MetaculusClient", lambda token: ClosableClient([_question()]))
     monkeypatch.setattr("bot.venues.llm.OpenRouterClient", FakeLlmClient)
@@ -327,3 +328,105 @@ def test_main_logs_dropped_run_reasons_and_announces_a_thinned_ensemble(
     printed = capsys.readouterr().out
     assert "THINNED" in printed  # a quiet degradation is now a loud one
     assert "HTTP 402" in printed
+
+
+# ------------------------------------------------------ two keys, one roster
+#
+# 2026-09-10: the donated key's OpenRouter account refuses x-ai (HTTP 404, "your
+# account's allowed-providers setting permits only: openai, anthropic,
+# google-ai-studio"), and Grok was the fourth family in the 08-24 roster that
+# scored +23.9/q. It runs on the owner's own key; everything else stays donated.
+
+
+class KeyedLlmClient:
+    """Records which key served which model."""
+
+    served: list[tuple[str, str]] = []
+
+    def __init__(self, key: str, **kwargs: Any) -> None:
+        self.key = key
+        self.total_cost_usd = 0.0
+        self.cost_by_model: dict[str, float] = {}
+
+    def models(self) -> set[str]:
+        return {"model-a", "x-ai/grok-test", "model-r"}
+
+    def complete(self, model: str, prompt: str, *, temperature: float = 1.0) -> str:
+        KeyedLlmClient.served.append((self.key, model))
+        return _binary_llm(model, prompt, temperature=temperature)
+
+    def key_limits(self) -> dict[str, Any]:
+        return {"limit_remaining": 99.0 if self.key == "donated" else 4.5}
+
+    def close(self) -> None:
+        return None
+
+
+class ClosableFakeClient(FakeClient):
+    def close(self) -> None:
+        return None
+
+
+def _two_key_env(monkeypatch: Any, tmp_path: Any, personal: str | None) -> Any:
+    from bot import forecast as fc
+
+    KeyedLlmClient.served = []
+    monkeypatch.setenv("METAC_FORECAST_MODELS", "model-a,x-ai/grok-test")
+    monkeypatch.setenv("METAC_RESEARCH_MODEL", "model-r")
+    monkeypatch.setattr(fc, "metaculus_token", lambda: "token")
+    monkeypatch.setattr(fc, "openrouter_key", lambda: "donated")
+    monkeypatch.setattr(fc, "openrouter_personal_key", lambda: personal)
+    monkeypatch.setattr(fc, "asknews_credentials", lambda: None)
+    monkeypatch.setattr(fc, "MetaculusClient", lambda token: ClosableFakeClient([_question()]))
+    monkeypatch.setattr("bot.venues.llm.OpenRouterClient", KeyedLlmClient)
+    monkeypatch.setattr(fc, "FORECAST_LOG", tmp_path / "forecasts.jsonl")
+    monkeypatch.setattr(fc, "POLL_LOG", tmp_path / "polls.jsonl")
+    return fc
+
+
+def _first_row(path: Any) -> dict[str, Any]:
+    import json
+
+    return dict(json.loads(path.read_text(encoding="utf-8").splitlines()[0]))
+
+
+def test_grok_runs_on_the_personal_key_and_everything_else_on_the_donated_one(
+    tmp_path: Any, monkeypatch: Any
+) -> None:
+    fc = _two_key_env(monkeypatch, tmp_path, personal="personal")
+
+    assert fc.main(["--tournament", "t"]) == 0
+
+    served = set(KeyedLlmClient.served)
+    assert ("personal", "x-ai/grok-test") in served
+    assert {("donated", "model-a"), ("donated", "model-r")} <= served
+    assert all(model.startswith("x-ai/") for key, model in served if key == "personal")
+    assert not any(model.startswith("x-ai/") for key, model in served if key == "donated")
+    row = _first_row(tmp_path / "forecasts.jsonl")
+    assert (row["runs_ok"], row["runs_failed"]) == (2, 0)  # the whole ensemble, none thinned
+
+
+def test_without_a_personal_key_grok_is_dropped_not_sent_to_a_key_that_refuses_it(
+    tmp_path: Any, monkeypatch: Any, capsys: Any
+) -> None:
+    """Sent to the donated key, Grok would fail on every question and every row
+    would read THINNED, burying the failures that matter under an expected one."""
+    fc = _two_key_env(monkeypatch, tmp_path, personal=None)
+
+    assert fc.main(["--tournament", "t"]) == 0
+
+    assert all(model != "x-ai/grok-test" for _, model in KeyedLlmClient.served)
+    row = _first_row(tmp_path / "forecasts.jsonl")
+    assert (row["runs_ok"], row["runs_failed"]) == (1, 0)  # dropped at startup, not per question
+    assert "OPENROUTER_PERSONAL_KEY absent" in capsys.readouterr().out
+
+
+def test_the_poll_log_records_both_keys_balances(tmp_path: Any, monkeypatch: Any) -> None:
+    """The personal key runs dry on its own schedule; the log must show it."""
+    fc = _two_key_env(monkeypatch, tmp_path, personal="personal")
+
+    fc.main(["--tournament", "t"])
+
+    row = _first_row(tmp_path / "polls.jsonl")
+    assert row["credits_remaining"] == 99.0
+    assert row["personal_credits_remaining"] == 4.5

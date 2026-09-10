@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -34,6 +35,19 @@ def openrouter_key() -> str | None:
     return key or None
 
 
+def openrouter_personal_key() -> str | None:
+    """The owner's own OpenRouter key, for the providers the donated key refuses.
+
+    Measured 2026-09-10: the donated key's account allows only openai, anthropic
+    and google-ai-studio, and x-ai/grok-4.6 returns HTTP 404. None when unset:
+    the roster then drops the models that need it, rather than sending every
+    question a run that is certain to fail.
+    """
+    env = {**load_dotenv(), **os.environ}
+    key = env.get("OPENROUTER_PERSONAL_KEY", "").strip()
+    return key or None
+
+
 def asknews_credentials() -> tuple[str, str] | None:
     """AskNews client id + secret, or None. A missing bonus research source
     degrades research breadth; it must never block a submission window."""
@@ -55,3 +69,33 @@ def metaculus_token() -> str | None:
     env = {**load_dotenv(), **os.environ}
     token = env.get("METACULUS_TOKEN", "").strip()
     return token or None
+
+
+@dataclass(frozen=True)
+class MailSettings:
+    """Where funding alerts are sent from and to. The password is a Gmail app password."""
+
+    user: str
+    password: str
+    to: str
+
+    def __repr__(self) -> str:
+        """Never let the password reach a log line or a traceback."""
+        return f"MailSettings(user={self.user!r}, password=***, to={self.to!r})"
+
+
+def alert_mail_settings() -> MailSettings | None:
+    """The Gmail login for funding alerts, or None when alerts are not configured.
+
+    None switches alerts off, with a note at startup; it never blocks
+    forecasting. ALERT_EMAIL_TO defaults to the sending address, so the owner
+    mails themselves. Google shows app passwords in groups of four with spaces;
+    the spaces are dropped, so a pasted password works as shown.
+    """
+    env = {**load_dotenv(), **os.environ}
+    user = env.get("ALERT_SMTP_USER", "").strip()
+    password = env.get("ALERT_SMTP_PASSWORD", "").replace(" ", "").strip()
+    to = env.get("ALERT_EMAIL_TO", "").strip() or user
+    if user and password:
+        return MailSettings(user=user, password=password, to=to)
+    return None
