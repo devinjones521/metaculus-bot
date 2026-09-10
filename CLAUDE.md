@@ -1,5 +1,8 @@
 # metaculus-bot — devinjones-bot
 
+**Start with `HANDOVER.local.md` if it exists.** It is gitignored and holds the local status,
+to-dos and private context that must not be published.
+
 Split out of `../free money` on 2026-09-10. Every design receipt: `docs/METHOD.md`. The private
 research record (window sweep, kill criteria K1–K4) stays in `../free money/findings/WINDOWS.md`.
 **This repo is PUBLIC** (open-source bots get ~2x Metaculus credit): nothing personal goes in it.

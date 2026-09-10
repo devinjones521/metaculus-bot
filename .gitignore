@@ -14,6 +14,9 @@ scratch/
 .env.*
 secrets/
 
+# Local session hand-off: status, to-dos, private context. Never published.
+*.local.md
+
 # Box-local liveness state, overwritten every 20 minutes. Committing it would
 # make every deploy a merge conflict and the file would be stale on arrival.
 data/metaculus/heartbeat-*.json
