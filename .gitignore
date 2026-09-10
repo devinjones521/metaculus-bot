@@ -24,3 +24,5 @@ data/metaculus/heartbeat-*.json
 data/metaculus/*.tmp
 # The level each funding alert last mailed. Box-local memory, same reasoning.
 data/metaculus/alerts.json
+# The question ids each tournament has shown, for the 'is open' email.
+data/metaculus/notify-*.json

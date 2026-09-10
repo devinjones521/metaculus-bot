@@ -430,3 +430,57 @@ def test_the_poll_log_records_both_keys_balances(tmp_path: Any, monkeypatch: Any
     row = _first_row(tmp_path / "polls.jsonl")
     assert row["credits_remaining"] == 99.0
     assert row["personal_credits_remaining"] == 4.5
+
+
+# ------------------------------------------------- the answer, in words
+#
+# 2026-09-10: the owner is mailed what the bot answered. The payload is not
+# readable (a 201-point CDF), so the pipeline records the answer in words.
+
+
+def test_the_answer_is_recorded_in_words_for_every_question_type() -> None:
+    binary = run_tournament("t", FakeClient([_question()]), _binary_llm, MODELS, "r", today=TODAY)
+    assert binary[0].answer == "30%"
+
+    def mc_llm(model: str, prompt: str, *, temperature: float = 1.0) -> str:
+        if "research assistant" in prompt or "left gaps" in prompt:
+            return "brief. REMAINING GAPS: none"
+        return "Texas: 20%\nArizona: 55%\nOther: 25%"
+
+    mc_question = _question(qtype="multiple_choice", options=("Texas", "Arizona", "Other"))
+    mc = run_tournament("t", FakeClient([mc_question]), mc_llm, MODELS, "r", today=TODAY)
+    assert mc[0].answer == "Arizona 55%, Other 25%, Texas 20%"
+
+    def numeric_llm(model: str, prompt: str, *, temperature: float = 1.0) -> str:
+        if "research assistant" in prompt or "left gaps" in prompt:
+            return "brief. REMAINING GAPS: none"
+        return "\n".join(
+            f"Percentile {int(p * 100)}: {60 + 40 * p:.1f}" for p in NUMERIC_PERCENTILES
+        )
+
+    numeric_question = _question(
+        qtype="numeric",
+        unit="$/bbl",
+        range_min=55.0,
+        range_max=130.0,
+        open_lower_bound=True,
+        open_upper_bound=True,
+    )
+    numeric = run_tournament(
+        "t", FakeClient([numeric_question]), numeric_llm, MODELS, "r", today=TODAY
+    )
+    assert numeric[0].answer == "median 80 $/bbl (80% range 64–96 $/bbl)"
+
+
+def test_date_answers_read_as_dates_and_tails_keep_a_decimal() -> None:
+    import datetime as dt
+
+    from bot.forecast import _describe_percentiles, _percent
+
+    stamps = {0.1: 1790000000.0, 0.5: 1795000000.0, 0.9: 1800000000.0}
+    day = [
+        dt.datetime.fromtimestamp(stamps[p], dt.UTC).strftime("%Y-%m-%d") for p in (0.5, 0.1, 0.9)
+    ]
+    text = _describe_percentiles(_question(qtype="date"), stamps)
+    assert text == f"median {day[0]} (80% range {day[1]}–{day[2]})"
+    assert (_percent(0.3), _percent(0.015), _percent(0.985)) == ("30%", "1.5%", "98.5%")

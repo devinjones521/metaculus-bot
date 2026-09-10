@@ -67,6 +67,7 @@ from bot.config import alert_mail_settings
 from bot.forecast import (
     DATA_DIR,
     POLL_LOG,
+    ForecastResult,
     Session,
     SetupError,
     append_jsonl,
@@ -74,6 +75,7 @@ from bot.forecast import (
     sweep_and_log,
     use_utf8_stdio,
 )
+from bot.notify import notify_sweep
 
 # Questions live ~3h, so any interval well under that sees every question with
 # most of its life left. 20 minutes costs one listing call per idle tick.
@@ -146,6 +148,7 @@ def poll(
     max_sweeps: int | None = None,
     wait_at_floor: bool = False,
     alert: Callable[[dict[str, float | None]], list[str]] | None = None,
+    notify: Callable[[str, list[ForecastResult]], list[str]] | None = None,
     now: Callable[[], dt.datetime] | None = None,
     sleep: Callable[[float], None] | None = None,
 ) -> PollOutcome:
@@ -229,6 +232,13 @@ def poll(
                     session, tournament, dry_run=dry_run, limit=cap, resubmit=False
                 )
                 submitted += summary.submitted
+                if notify is not None:
+                    try:
+                        for subject in notify(tournament, summary.results):
+                            print(f"emailed: {subject}")
+                            append_jsonl(POLL_LOG, row(credits_remaining=credit, notified=subject))
+                    except Exception as exc:  # noqa: BLE001 - a mail bug must never cost a sweep
+                        print(f"  NOTIFY FAILED: {type(exc).__name__}: {exc}")
             except KeyboardInterrupt:
                 raise
             except Exception as exc:  # noqa: BLE001 - contain, record, keep polling
@@ -330,6 +340,7 @@ def main(argv: list[str] | None = None) -> int:
             max_sweeps=args.max_sweeps,
             wait_at_floor=args.wait_at_floor,
             alert=mail_alerter(args.min_credit, args.cost_per_question),
+            notify=None if args.dry_run else mail_notifier(),
         )
     except KeyboardInterrupt:
         print("\ninterrupted — stopping after the current sweep.")
@@ -366,6 +377,23 @@ def mail_alerter(
 
     print(f"funding alerts ON: mail to {settings.to} on each change of level.")
     return alert
+
+
+def mail_notifier() -> Callable[[str, list[ForecastResult]], list[str]] | None:
+    """The per-sweep hook that mails tournament openings and every answer, or None
+    when mail is not set up (mail_alerter has already said so at startup)."""
+    settings = alert_mail_settings()
+    if settings is None:
+        return None
+    from bot.venues.mail import send_mail
+
+    send = functools.partial(send_mail, settings)
+
+    def notify(tournament: str, results: list[ForecastResult]) -> list[str]:
+        return notify_sweep(tournament, results, send, now=dt.datetime.now(dt.UTC))
+
+    print("answer emails ON: tournament openings and every sweep's answers.")
+    return notify
 
 
 if __name__ == "__main__":

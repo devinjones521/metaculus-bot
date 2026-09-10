@@ -44,6 +44,7 @@ def _no_writes_to_real_data(tmp_path: Any, monkeypatch: Any) -> None:
     monkeypatch.setattr(bp, "alert_mail_settings", lambda: None)
     monkeypatch.setattr("bot.alerts.STATE_PATH", tmp_path / "alerts.json")
     monkeypatch.setattr("bot.forecast.openrouter_personal_key", lambda: None)
+    monkeypatch.setattr("bot.notify.STATE_DIR", tmp_path)
 
 
 class FakeSession:
@@ -521,3 +522,86 @@ def test_main_wires_alerts_only_when_mail_is_configured(monkeypatch: Any, capsys
     monkeypatch.setattr(bp, "alert_mail_settings", lambda: settings)
     assert bp.main(["--hours", "1"]) == 0
     assert callable(seen["alert"])  # wired, and never called here: nothing is sent
+
+
+# ------------------------------------------------- openings and answers by mail
+
+
+def test_each_sweep_hands_its_results_to_the_notifier_and_logs_what_was_sent(
+    tmp_path: Any, monkeypatch: Any
+) -> None:
+    from bot.forecast import ForecastResult, SweepSummary
+
+    result = ForecastResult(
+        question_id=1, post_id=2, title="Will X?", qtype="binary", submitted=True, answer="30%"
+    )
+    monkeypatch.setattr(
+        bp, "sweep_and_log", lambda *a, **k: SweepSummary(1, 1, 0, 0.0, 50.0, results=[result])
+    )
+    seen: list[tuple[str, list[Any]]] = []
+
+    def notify(tournament: str, results: list[Any]) -> list[str]:
+        seen.append((tournament, results))
+        return ["devinjones-bot answered 1 question in minibench"]
+
+    clock = FakeClock()
+    bp.poll(
+        FakeSession(),
+        "minibench",
+        until=START + dt.timedelta(minutes=40),
+        interval_seconds=20 * 60,
+        notify=notify,
+        now=clock,
+        sleep=clock.sleep,
+    )
+
+    assert [tournament for tournament, _ in seen] == ["minibench", "minibench"]
+    assert seen[0][1] == [result]
+    notified = [r.get("notified") for r in _rows(tmp_path / "polls.jsonl")]
+    assert notified == ["devinjones-bot answered 1 question in minibench"] * 2
+
+
+def test_a_broken_notifier_never_costs_a_sweep(tmp_path: Any, monkeypatch: Any) -> None:
+    """The forecast has already been submitted when the mail goes wrong. Recording
+    that sweep as failed would be a lie, and stopping the loop would be worse."""
+    swept: list[int] = []
+    monkeypatch.setattr(bp, "sweep_and_log", lambda *a, **k: (swept.append(1), _summary())[1])
+
+    def notify(tournament: str, results: list[Any]) -> list[str]:
+        raise RuntimeError("a bug in the mailer")
+
+    clock = FakeClock()
+    outcome = bp.poll(
+        FakeSession(),
+        "minibench",
+        until=START + dt.timedelta(minutes=60),
+        interval_seconds=20 * 60,
+        notify=notify,
+        now=clock,
+        sleep=clock.sleep,
+    )
+
+    assert len(swept) == 3 and outcome.submitted == 3
+    assert not (tmp_path / "polls.jsonl").exists()  # no sweep recorded as failed
+
+
+def test_main_wires_the_notifier_only_with_mail_and_never_on_a_dry_run(monkeypatch: Any) -> None:
+    from bot.config import MailSettings
+
+    seen: dict[str, Any] = {}
+
+    def fake_poll(session: Any, tournament: str, **kwargs: Any) -> Any:
+        seen.update(kwargs)
+        return bp.PollOutcome(0, 0, "deadline reached")
+
+    monkeypatch.setattr(bp, "build_session", lambda dry_run: FakeSession())
+    monkeypatch.setattr(bp, "poll", fake_poll)
+
+    assert bp.main(["--hours", "1"]) == 0
+    assert seen["notify"] is None
+    settings = MailSettings(user="bot@example.com", password="fake", to="me@example.com")
+    monkeypatch.setattr(bp, "alert_mail_settings", lambda: settings)
+    assert bp.main(["--hours", "1"]) == 0
+    assert callable(seen["notify"])
+    assert bp.main(["--hours", "1", "--dry-run"]) == 0
+    assert seen["notify"] is None  # a rehearsal must never mail "answered"

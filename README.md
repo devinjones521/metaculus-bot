@@ -64,6 +64,14 @@ you when either key runs low, runs out, or is topped up: once per change, not on
 The donated key's "empty" is exactly the point at which the poller parks and stops forecasting.
 `uv run python -m bot.alerts --test` sends one test email.
 
+### Answer emails
+
+With the same settings, the poller also emails you what it does:
+- **When a tournament opens:** the first new questions after at least a day with none, e.g. a MiniBench cycle starting.
+- **After every sweep that submitted or failed anything:** each question, its link, the forecast in words ("37%", "median 6,512 (80% range 6,380–6,650)"), and how many of the five models contributed.
+
+A sweep that did nothing sends nothing, and dry runs never send.
+
 ## Invariants (`bot.verify`, one exit code)
 
 1. All network access lives in `bot/venues/`, so there is one place to audit.

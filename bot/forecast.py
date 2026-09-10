@@ -174,6 +174,7 @@ class ForecastResult:
     run_errors: list[str] = field(default_factory=list)
     error: str | None = None
     log: list[str] = field(default_factory=list)
+    answer: str = ""  # the forecast in words, for the owner's email
 
 
 # ------------------------------------------------------------------ research
@@ -220,16 +221,38 @@ def gather_research(
 # ----------------------------------------------------------------- pipeline
 
 
+def _percent(p: float) -> str:
+    """37%, or 1.5% / 98.5% in the tails, where a whole percent would hide the forecast."""
+    value = p * 100
+    return f"{value:.1f}%" if value < 10 or value > 90 else f"{value:.0f}%"
+
+
+def _number(value: float, qtype: str) -> str:
+    if qtype == "date" and value > 1e8:  # date questions are scaled in Unix seconds
+        return dt.datetime.fromtimestamp(value, dt.UTC).strftime("%Y-%m-%d")
+    return f"{value:,.0f}" if abs(value) >= 1000 else f"{value:.3g}"
+
+
+def _describe_percentiles(question: Question, percentiles: Mapping[float, float]) -> str:
+    """The submitted distribution in words: its median and 80% range, in the question's unit."""
+    unit = f" {question.unit}" if question.unit and question.qtype != "date" else ""
+    q = question.qtype
+    return (
+        f"median {_number(percentiles[0.5], q)}{unit} "
+        f"(80% range {_number(percentiles[0.1], q)}–{_number(percentiles[0.9], q)}{unit})"
+    )
+
+
 def forecast_question(
     question: Question,
     llm: Callable[..., str],
     models: tuple[str, ...],
     research: str,
     today: str,
-) -> tuple[dict[str, Any], str, int, int, bool, list[str]]:
+) -> tuple[dict[str, Any], str, int, int, bool, list[str], str]:
     """One question through ensemble → aggregate → payload.
 
-    Returns (payload, rationale, runs_ok, runs_failed, suspect, run_errors).
+    Returns (payload, rationale, runs_ok, runs_failed, suspect, run_errors, answer).
     Raises only if NO run parsed — the caller records that as a loud failure.
 
     Every dropped run's reason is kept and returned, because a dropped run costs
@@ -273,12 +296,16 @@ def forecast_question(
                 suspect = True
                 rationales.append(f"### Extremeness check FAILED ({exc}) — treating as SUSPECT")
         final = aggregate_binary(runs, suspect=suspect)
+        answer = _percent(final)
         payload = binary_payload(question.question_id, round(final, 4))
     elif question.qtype == "multiple_choice":
         distribution = aggregate_multiple_choice(runs, question.options)
+        ranked = sorted(distribution.items(), key=lambda item: -item[1])
+        answer = ", ".join(f"{option} {_percent(p)}" for option, p in ranked)
         payload = multiple_choice_payload(question.question_id, distribution, question.options)
     else:
         percentiles = aggregate_percentiles(runs)
+        answer = _describe_percentiles(question, percentiles)
         if question.range_min is None or question.range_max is None:
             raise RuntimeError("continuous question without scaling range")
         cdf = build_cdf(
@@ -299,7 +326,7 @@ def forecast_question(
         payload = numeric_payload(question.question_id, cdf, question.cdf_points)
 
     rationale = "\n\n".join(rationales)[:MAX_COMMENT_CHARS]
-    return payload, rationale, len(runs), len(run_errors), suspect, run_errors
+    return payload, rationale, len(runs), len(run_errors), suspect, run_errors, answer
 
 
 def run_tournament(
@@ -360,7 +387,7 @@ def run_tournament(
         )
         try:
             research = gather_research(question, llm, research_model, asknews_search, today)
-            payload, rationale, ok, failed, suspect, run_errors = forecast_question(
+            payload, rationale, ok, failed, suspect, run_errors, answer = forecast_question(
                 question, llm, models, research, today
             )
             client.submit([payload])
@@ -369,6 +396,7 @@ def run_tournament(
             result.forecast = _summarise_payload(payload)
             result.runs_ok, result.runs_failed, result.suspect = ok, failed, suspect
             result.run_errors = run_errors
+            result.answer = answer
         except Exception as exc:  # noqa: BLE001 - contain, record, continue
             result.error = f"{type(exc).__name__}: {exc}"
         results.append(result)
@@ -578,6 +606,7 @@ class SweepSummary:
     failed: int
     cost_usd: float  # THIS sweep only — see sweep_and_log
     credits_remaining: float | None
+    results: list[ForecastResult] = field(default_factory=list)
 
 
 def _spend(session: Session) -> tuple[float, dict[str, float]]:
@@ -697,6 +726,7 @@ def sweep_and_log(
         failed=len(failed),
         cost_usd=sweep_cost,
         credits_remaining=remaining,
+        results=results,
     )
 
 

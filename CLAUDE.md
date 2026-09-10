@@ -48,3 +48,6 @@ Fixed 2026-09-10: Gemini 3.1 Pro's HTTP 429 (replaced by `gemini-3.8-flash`, evi
 - `OPENROUTER_PERSONAL_KEY` is the owner's own, and pays for `x-ai/*` (Grok) only, ~$0.03/question.
 - `bot.alerts` mails the owner on every change of level (ok → low → empty → funded again) for each
   key, from the pollers themselves. Gmail SMTP on port 587: the box blocks 25 and 465.
+- `bot.notify` mails the owner when a tournament opens (the first new questions after a quiet day)
+  and, after every sweep that submitted or failed anything, what was answered. Each tournament's
+  memory lives in `data/metaculus/notify-<slug>.json` on the box.
