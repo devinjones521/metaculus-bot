@@ -1,0 +1,20 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+scratch/
+
+# Credentials. This repo is PUBLIC: the Metaculus token submits forecasts as
+# devinjones-bot and the OpenRouter key spends donated credit. `bot.verify`
+# also scans every tracked file for key-shaped strings, because an ignore rule
+# only protects the one filename it names.
+.env
+.env.*
+secrets/
+
+# Box-local liveness state, overwritten every 20 minutes. Committing it would
+# make every deploy a merge conflict and the file would be stale on arrival.
+data/metaculus/heartbeat-*.json
+data/metaculus/*.tmp

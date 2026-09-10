@@ -1,0 +1,29 @@
+# One poller per tournament: metaculus-poll@minibench, metaculus-poll@fall-futureeval-2026.
+# Installed by deploy/push.sh on the Hetzner box (204.168.148.150). See deploy/units.
+[Unit]
+Description=devinjones-bot Metaculus poller (%i)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/metaculus-bot
+# Without this the service looks healthy while writing nothing to its log.
+Environment=PYTHONUNBUFFERED=1
+# The Fall season's end is the deadline: "an endless poll is not a plan".
+# --wait-at-floor: park when credit runs low, resume when Metaculus tops up.
+ExecStart=/root/.local/bin/uv run --frozen --no-dev python -m bot.poll --tournament %i --until 2027-03-05T00:00Z --wait-at-floor
+# on-failure, not always: the loop only exits cleanly at its deadline, and a
+# clean exit restarted forever is a crash loop that is-active reports as fine.
+Restart=on-failure
+RestartSec=300
+# This box also serves live websites. A sleeping Python process with bursts of
+# HTTP needs a fraction of this; the caps make a runaway unable to hurt them.
+MemoryMax=512M
+CPUQuota=50%
+Nice=10
+StandardOutput=append:/var/log/metaculus-bot/%i.log
+StandardError=append:/var/log/metaculus-bot/%i.log
+
+[Install]
+WantedBy=multi-user.target

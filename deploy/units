@@ -1,0 +1,5 @@
+# systemd unit instances deployed on the Hetzner box (204.168.148.150) by deploy/push.sh.
+# The `poller contract` invariant in bot/verify.py requires every line here to
+# have a matching entry in bot.health.POLLERS, and vice versa.
+metaculus-poll@minibench
+metaculus-poll@fall-futureeval-2026
