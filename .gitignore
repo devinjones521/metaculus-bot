@@ -12,6 +12,7 @@ scratch/
 # only protects the one filename it names.
 .env
 .env.*
+!.env.example
 secrets/
 
 # Local session hand-off: status, to-dos, private context. Never published.
