@@ -24,6 +24,18 @@ research record (window sweep, kill criteria K1–K4) stays in `../free money/fi
    `polls.jsonl` has a row per sweep, including failed ones, and `bot.health` reads its age.
 7. **Never weaken, skip or delete a test to go green.**
 
+## Known defects — found by the first live run, 2026-09-10. Fix these first.
+1. **Gemini 3.1 Pro returns HTTP 429** ("exceeded your current quota") on the donated key, which
+   thins every ensemble to 4/5 and to two model families. Metaculus says Google's side is
+   misconfigured. Replace it in `DEFAULT_FORECAST_MODELS` on evidence from the first warmup sweeps.
+2. **`llm_cost_usd` logs $0.00 while the balance falls** (the first forecast cost $0.93). The
+   donated key returns no `usage.cost`. The budget guard reads the balance, so it is unaffected;
+   the log is wrong. Derive per-sweep cost from the balance delta.
+3. **Comment privacy is unproven for MiniBench.** The 08-24 MiniBench comments read
+   `is_private: false`, while the 09-10 practice comment is private. Read the flag on the first
+   warmup comment (list with `?author=307009&is_private=true`; the plain listing hides private
+   comments, and `?on_post=` returns 403).
+
 ## Funding
 The OpenRouter key is **donated by Metaculus** (emailed 2026-09-10): $100 for FutureEval
 and MiniBench, raised automatically on above-average MiniBench performance, and ~2x for open-source
