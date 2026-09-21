@@ -61,6 +61,13 @@ CDF_POINTS = 201
 PAGE_PAUSE_SECONDS = 2.0
 MAX_RETRY_AFTER_SECONDS = 120.0
 
+# A connection that dies before the response carries no status code, so the
+# Retry-After path below never sees it. In the MiniBench opening hour on
+# 2026-09-21 that killed four questions: three lost the submission, and q45942
+# lost only the COMMENT, leaving a forecast on the board with no reasoning
+# attached and a log row that called it a failure.
+TRANSPORT_RETRY_PAUSE_SECONDS = 5.0
+
 
 @dataclass(frozen=True)
 class Question:
@@ -317,13 +324,21 @@ class MetaculusClient:
         return standing
 
     def _request(self, method: str, url: str, **kwargs: Any) -> httpx.Response:
-        """One request, with a single polite retry on 429.
+        """One request, with a single polite retry on 429 or a dropped connection.
 
         Exactly one retry, honouring Retry-After up to a cap: a loop that retries
         forever turns a server-side problem into a silent hang, and a bot that
         hangs during a submission window misses it without reporting anything.
+
+        Only reads come through here, so resending one that died without a
+        response cannot duplicate anything. The two writes carry that risk and
+        each handles it in its own way: see `submit` and `comment`.
         """
-        response = self._http.request(method, url, **kwargs)
+        try:
+            response = self._http.request(method, url, **kwargs)
+        except httpx.TransportError:
+            time.sleep(TRANSPORT_RETRY_PAUSE_SECONDS)
+            response = self._http.request(method, url, **kwargs)
         if response.status_code == httpx.codes.TOO_MANY_REQUESTS:
             retry_after = response.headers.get("Retry-After", "")
             delay = float(retry_after) if retry_after.replace(".", "", 1).isdigit() else 30.0
@@ -332,24 +347,50 @@ class MetaculusClient:
         response.raise_for_status()
         return response
 
-    def submit(self, payloads: Sequence[Mapping[str, Any]]) -> None:
+    def submit(self, payloads: Sequence[Mapping[str, Any]], *, post_id: int | None = None) -> None:
         """Submit one or more forecasts. Raises on any non-2xx: an unsubmitted
-        forecast must never look like a submitted one."""
+        forecast must never look like a submitted one.
+
+        `post_id` is what makes a dropped connection recoverable. The write may
+        or may not have landed, and a blind resend could put a SECOND forecast
+        on a question this project allows exactly one forecast on, so the server
+        is asked what it holds before anything is resent. Without a post id
+        there is no safe answer and the error is raised — which is why the
+        resubmit path, where a standing forecast proves nothing, passes none.
+        """
         if not payloads:
             return
-        response = self._http.post(f"{API}/questions/forecast/", json=list(payloads))
+        try:
+            response = self._http.post(f"{API}/questions/forecast/", json=list(payloads))
+        except httpx.TransportError:
+            if post_id is None:
+                raise
+            time.sleep(TRANSPORT_RETRY_PAUSE_SECONDS)
+            wanted = {int(p["question"]) for p in payloads if p.get("question") is not None}
+            if wanted and wanted <= self.forecast_standing(post_id):
+                return  # it landed; only the response was lost
+            response = self._http.post(f"{API}/questions/forecast/", json=list(payloads))
         response.raise_for_status()
 
     def comment(self, post_id: int, text: str) -> None:
         """Attach the bot's reasoning to a post as a private comment. Tournament
-        rules ask for reasoning; private keeps it out of other bots' retrieval."""
-        response = self._http.post(
-            f"{API}/comments/create/",
-            json={
-                "on_post": post_id,
-                "text": text,
-                "is_private": True,
-                "included_forecast": True,
-            },
-        )
+        rules ask for reasoning; private keeps it out of other bots' retrieval.
+
+        Resent once if the connection dies. There is no cheap way to ask whether
+        a lost comment landed, so this can post a duplicate: two private
+        comments cost nothing, while a forecast with no reasoning is not
+        eligible for a prize and cannot be fixed by a later sweep, because the
+        standing forecast makes the sweep skip the question.
+        """
+        body = {
+            "on_post": post_id,
+            "text": text,
+            "is_private": True,
+            "included_forecast": True,
+        }
+        try:
+            response = self._http.post(f"{API}/comments/create/", json=body)
+        except httpx.TransportError:
+            time.sleep(TRANSPORT_RETRY_PAUSE_SECONDS)
+            response = self._http.post(f"{API}/comments/create/", json=body)
         response.raise_for_status()

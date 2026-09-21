@@ -53,6 +53,33 @@ No forecasting score exists for 3.8 Flash itself yet. The first warmup sweeps ar
 OpenAI, Anthropic and Google (measured 2026-09-10: HTTP 404 on `x-ai/*`). Without that key the
 roster drops Grok at startup rather than failing it on every question.
 
+## What the wire does, and what the bot does about it
+
+Measured on 2026-09-21, MiniBench's opening hour: four questions out of nine died with
+`httpx.RemoteProtocolError: Server disconnected without sending a response.` — the server closed
+the connection with no status code on it. Both retry paths in this bot were keyed on status codes
+(429 here, 429/500/502/503 at OpenRouter), so none of them ever saw these, and the errors went
+straight out as dead questions. One of the four had died on the *comment* call, after its forecast
+had landed: a forecast on the board with no reasoning attached, which no later sweep would fix,
+because the standing forecast makes the next sweep skip the question.
+
+| write | what a dropped connection now does | why not the other thing |
+|---|---|---|
+| forecast submission | ask the server what it holds, then resend only if nothing landed | a blind resend can put a second forecast on a question this project allows exactly one on |
+| comment | resend once | a duplicate private comment costs nothing; a forecast with no reasoning is not prize-eligible and cannot be fixed later |
+| reads (listings, standing forecasts) | resend once | idempotent, so there is nothing to duplicate |
+| LLM completion | resend once | it can pay twice for one answer; losing a run costs the ensemble median, which is the largest measured edge here |
+
+Exactly one retry everywhere. A loop that retries forever turns a server-side problem into a
+silent hang, and the submission window is three hours wide.
+
+The same day showed why a stage that fails needs a name of its own: the sweep recorded the
+uncommented question as `submitted: false, runs_ok: 0, FAILED`, which is indistinguishable from a
+question the bot never got to — while five runs had been paid for and the forecast was live. The
+ensemble result is now written down before the network call, and a lost comment is logged,
+printed and emailed as `comment_failed`, apart from the failure count, because only a person can
+repair it and only before the question closes.
+
 ## Deliberately not built yet
 
 Each waits until MiniBench scores say it matters:

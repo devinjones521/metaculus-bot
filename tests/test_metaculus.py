@@ -8,10 +8,15 @@ went anywhere at all while the run reported clean.
 
 from __future__ import annotations
 
+import time
+from typing import Any
+
+import httpx
 import pytest
 
 from bot.venues.metaculus import (
     CDF_POINTS,
+    MetaculusClient,
     binary_payload,
     multiple_choice_payload,
     next_page_url,
@@ -190,3 +195,123 @@ def test_empty_page_parses_to_no_questions() -> None:
     """Prove the null can fire: an empty tournament reads as zero questions,
     not as a crash and not as fabricated rows."""
     assert parse_posts({"results": []}) == []
+
+
+# ---------------------------------------------------------------------------
+# The wire dying mid-request. On 2026-09-21 four MiniBench questions hit
+# `RemoteProtocolError: Server disconnected without sending a response`, which
+# carries no status code and so walked straight past the Retry-After path. One
+# of them (q45942) died on the COMMENT, after its forecast had landed: a
+# blind resend of a write is the one thing that must never happen, and doing
+# nothing left a forecast on the board with no reasoning attached.
+
+
+def _dropped(_: httpx.Request) -> httpx.Response:
+    raise httpx.RemoteProtocolError("Server disconnected without sending a response.")
+
+
+class _Wire:
+    """A scripted transport: one handler per path, called in order, recording
+    every attempt so a test can count resends rather than infer them."""
+
+    def __init__(self, routes: dict[str, list[Any]]) -> None:
+        self.routes = {path: list(responses) for path, responses in routes.items()}
+        self.attempts: list[str] = []
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        self.attempts.append(f"{request.method} {path}")
+        queue = self.routes.get(path)
+        if not queue:
+            raise AssertionError(f"unscripted call: {request.method} {path}")
+        step = queue.pop(0) if len(queue) > 1 else queue[0]
+        if callable(step):
+            return step(request)
+        return step
+
+    def count(self, method: str, path: str) -> int:
+        return self.attempts.count(f"{method} {path}")
+
+    def client(self) -> MetaculusClient:
+        return MetaculusClient("token", client=httpx.Client(transport=httpx.MockTransport(self)))
+
+
+def _post_with_standing(question_id: int, standing: bool) -> httpx.Response:
+    latest = {"start_time": 1789989804.0} if standing else None
+    return httpx.Response(
+        200, json={"id": 45757, "question": {"id": question_id, "my_forecasts": {"latest": latest}}}
+    )
+
+
+def test_a_submission_lost_on_the_wire_is_not_resent_once_the_server_shows_it_landed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The forecast is in, only the response was lost. A resend here would put a
+    second forecast on a question this project allows exactly one on."""
+    monkeypatch.setattr(time, "sleep", lambda _: None)
+    wire = _Wire(
+        {
+            "/api/questions/forecast/": [_dropped],
+            "/api/posts/45757/": [_post_with_standing(45942, standing=True)],
+        }
+    )
+    wire.client().submit([binary_payload(45942, 0.3)], post_id=45757)
+    assert wire.count("POST", "/api/questions/forecast/") == 1
+    assert wire.count("GET", "/api/posts/45757/") == 1
+
+
+def test_a_submission_lost_on_the_wire_is_resent_when_nothing_landed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(time, "sleep", lambda _: None)
+    wire = _Wire(
+        {
+            "/api/questions/forecast/": [_dropped, httpx.Response(201, json={})],
+            "/api/posts/45757/": [_post_with_standing(45942, standing=False)],
+        }
+    )
+    wire.client().submit([binary_payload(45942, 0.3)], post_id=45757)
+    assert wire.count("POST", "/api/questions/forecast/") == 2
+
+
+def test_a_submission_is_never_resent_blind(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Without a post id the server cannot be asked what it holds, so the error
+    is raised. A dead question is recoverable next sweep; a double forecast is not."""
+    monkeypatch.setattr(time, "sleep", lambda _: None)
+    wire = _Wire({"/api/questions/forecast/": [_dropped]})
+    with pytest.raises(httpx.RemoteProtocolError):
+        wire.client().submit([binary_payload(45942, 0.3)])
+    assert wire.count("POST", "/api/questions/forecast/") == 1
+
+
+def test_a_second_drop_raises_rather_than_looping(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(time, "sleep", lambda _: None)
+    wire = _Wire(
+        {
+            "/api/questions/forecast/": [_dropped],
+            "/api/posts/45757/": [_post_with_standing(45942, standing=False)],
+        }
+    )
+    with pytest.raises(httpx.RemoteProtocolError):
+        wire.client().submit([binary_payload(45942, 0.3)], post_id=45757)
+    assert wire.count("POST", "/api/questions/forecast/") == 2
+
+
+def test_a_comment_lost_on_the_wire_is_resent(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A duplicate private comment costs nothing. A forecast with no reasoning
+    is not prize-eligible and no later sweep returns to it."""
+    monkeypatch.setattr(time, "sleep", lambda _: None)
+    wire = _Wire({"/api/comments/create/": [_dropped, httpx.Response(201, json={"id": 1})]})
+    wire.client().comment(45757, "the reasoning")
+    assert wire.count("POST", "/api/comments/create/") == 2
+
+
+def test_a_dropped_read_is_retried(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Reads are idempotent, so this one is free: a dropped listing used to kill
+    a whole sweep rather than one question."""
+    monkeypatch.setattr(time, "sleep", lambda _: None)
+    wire = _Wire(
+        {"/api/posts/": [_dropped, httpx.Response(200, json={"results": [], "next": None})]}
+    )
+    assert wire.client().open_questions("minibench") == []
+    assert wire.count("GET", "/api/posts/") == 2

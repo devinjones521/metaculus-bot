@@ -133,7 +133,9 @@ class TournamentClient(Protocol):
 
     def forecast_standing(self, post_id: int) -> set[int]: ...
 
-    def submit(self, payloads: Sequence[Mapping[str, Any]]) -> None: ...
+    def submit(
+        self, payloads: Sequence[Mapping[str, Any]], *, post_id: int | None = None
+    ) -> None: ...
 
     def comment(self, post_id: int, text: str) -> None: ...
 
@@ -153,7 +155,7 @@ class DryRunClient:
     def forecast_standing(self, post_id: int) -> set[int]:
         return self._inner.forecast_standing(post_id)
 
-    def submit(self, payloads: Sequence[Mapping[str, Any]]) -> None:
+    def submit(self, payloads: Sequence[Mapping[str, Any]], *, post_id: int | None = None) -> None:
         print(f"[dry-run] submit: {list(payloads)}")
 
     def comment(self, post_id: int, text: str) -> None:
@@ -173,6 +175,11 @@ class ForecastResult:
     suspect: bool = False
     run_errors: list[str] = field(default_factory=list)
     error: str | None = None
+    # Set when the forecast went in but its reasoning did not. Separate from
+    # `error`, which means nothing was submitted: a question that is answered
+    # but uncommented is not a failed question, it is an ineligible one, and
+    # no later sweep will revisit it — the standing forecast makes it skip.
+    comment_error: str | None = None
     log: list[str] = field(default_factory=list)
     answer: str = ""  # the forecast in words, for the owner's email
 
@@ -390,15 +397,29 @@ def run_tournament(
             payload, rationale, ok, failed, suspect, run_errors, answer = forecast_question(
                 question, llm, models, research, today
             )
-            client.submit([payload])
-            client.comment(question.post_id, rationale)
-            result.submitted = True
+            # Written down BEFORE the network call. When a submission died on
+            # the wire on 2026-09-21 the row read `runs_ok: 0, forecast: null`,
+            # which is the shape of a question nothing was computed for — while
+            # five runs had in fact been paid for and only the write was lost.
             result.forecast = _summarise_payload(payload)
             result.runs_ok, result.runs_failed, result.suspect = ok, failed, suspect
             result.run_errors = run_errors
             result.answer = answer
+            # Under `resubmit` a standing forecast may predate this sweep, so it
+            # cannot tell the venue whether a dropped write landed.
+            client.submit([payload], post_id=None if resubmit else question.post_id)
+            result.submitted = True
         except Exception as exc:  # noqa: BLE001 - contain, record, continue
             result.error = f"{type(exc).__name__}: {exc}"
+            results.append(result)
+            continue
+        # A second write, which fails on its own terms. The forecast is already
+        # on the board, so this is never `error`: q45942 was logged as FAILED
+        # on 2026-09-21 with its forecast standing on Metaculus.
+        try:
+            client.comment(question.post_id, rationale)
+        except Exception as exc:  # noqa: BLE001 - recorded, loudly, and carried on
+            result.comment_error = f"{type(exc).__name__}: {exc}"
         results.append(result)
     return results
 
@@ -659,6 +680,7 @@ def sweep_and_log(
 
     submitted = sum(1 for r in results if r.submitted)
     failed = [r for r in results if r.error and not r.error.startswith("skipped")]
+    uncommented = [r for r in results if r.submitted and r.comment_error]
     for result in results:
         row = {
             "ts": started,
@@ -675,6 +697,7 @@ def sweep_and_log(
             "suspect": result.suspect,
             "run_errors": result.run_errors,
             "error": result.error,
+            "comment_error": result.comment_error,
         }
         if result.submitted or (result.error and not result.error.startswith("skipped")):
             append_jsonl(FORECAST_LOG, row)
@@ -695,6 +718,10 @@ def sweep_and_log(
             "questions_seen": len(results),
             "submitted": submitted,
             "failed": len(failed),
+            # Counted apart from `failed`, and never folded into it: these
+            # questions were answered. They are just not prize-eligible until
+            # someone posts the reasoning by hand.
+            "comment_failed": len(uncommented),
             "dry_run": dry_run,
             "credits_remaining": remaining,
             "personal_credits_remaining": session.personal_credits_remaining(),
@@ -710,6 +737,11 @@ def sweep_and_log(
     print(f"{tournament}: {len(results)} question(s) seen, {submitted} submitted.")
     for result in failed:
         print(f"  FAILED {result.question_id} {result.title[:60]}: {result.error}")
+    # Louder than a thinned ensemble: no sweep will come back to these, because
+    # the forecast that is already standing makes the next sweep skip them.
+    for result in uncommented:
+        print(f"  NO COMMENT {result.question_id} {result.title[:50]}: {result.comment_error}")
+        print(f"      forecast IS in; post the reasoning by hand on post {result.post_id}")
     # A thinned ensemble is a quieter defect than a dead question and costs the
     # design's largest measured edge, so it is reported, not left to the log.
     for result in results:

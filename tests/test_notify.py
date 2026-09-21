@@ -63,6 +63,20 @@ def test_a_sweep_that_did_nothing_mails_nothing() -> None:
     assert bn.answers_email("minibench", [], NOW) is None
 
 
+def test_an_uncommented_forecast_is_flagged_in_the_subject_line() -> None:
+    """2026-09-21: q45942's comment died on the wire and the mail called the
+    sweep a clean one. Only the owner can fix it, and only before the question
+    closes, so it goes where he cannot miss it."""
+    mute = _result(4, comment_error="RemoteProtocolError: Server disconnected")
+    mail = bn.answers_email("minibench", [_result(1), mute], NOW)
+    assert mail is not None
+    subject, body = mail
+    assert subject == "devinjones-bot answered 2 questions in minibench, 1 WITHOUT A COMMENT"
+    assert "NO COMMENT POSTED" in body and "RemoteProtocolError" in body
+    assert "by hand" in body
+    assert "FAILED" not in body  # it was answered; it is not a failure
+
+
 def test_a_failed_question_is_mailed_with_its_reason() -> None:
     dead = _result(3, submitted=False, runs_ok=0, error="RuntimeError: all 5 runs failed — 402")
     mail = bn.answers_email("minibench", [dead], NOW)

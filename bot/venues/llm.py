@@ -42,6 +42,11 @@ USER_AGENT = "metaculus-bot/0.2 (devinjones-bot; +https://github.com/devinjones5
 RETRYABLE = {429, 500, 502, 503}
 RETRY_PAUSE_SECONDS = 20.0
 
+# A connection that dies before the response has no status code to match on, so
+# it never reached the retry above: on 2026-09-21 one such drop went straight
+# out as a failed run and thinned an ensemble to 4/5.
+TRANSPORT_RETRY_PAUSE_SECONDS = 5.0
+
 
 class LlmError(RuntimeError):
     """Raised for any completion that did not produce usable text."""
@@ -126,16 +131,29 @@ class OpenRouterClient:
         }
 
     def _post_with_one_retry(self, path: str, body: dict[str, Any]) -> httpx.Response:
-        response = self._http.post(f"{API}{path}", json=body)
-        if response.status_code in RETRYABLE:
-            retry_after = response.headers.get("Retry-After", "")
-            delay = (
-                float(retry_after)
-                if retry_after.replace(".", "", 1).isdigit()
-                else RETRY_PAUSE_SECONDS
-            )
-            time.sleep(min(delay, 120.0))
+        """Exactly one retry, whether the status said "later" or the connection
+        died with nothing on it.
+
+        Resending a completion can pay twice for one answer, since a request
+        that died on the wire may have been served. That is the cheaper half of
+        the trade: a run that never happens costs the ensemble a whole model,
+        and the ensemble median is this design's measured edge.
+        """
+        try:
             response = self._http.post(f"{API}{path}", json=body)
+        except httpx.TransportError:
+            time.sleep(TRANSPORT_RETRY_PAUSE_SECONDS)
+            response = self._http.post(f"{API}{path}", json=body)
+        else:
+            if response.status_code in RETRYABLE:
+                retry_after = response.headers.get("Retry-After", "")
+                delay = (
+                    float(retry_after)
+                    if retry_after.replace(".", "", 1).isdigit()
+                    else RETRY_PAUSE_SECONDS
+                )
+                time.sleep(min(delay, 120.0))
+                response = self._http.post(f"{API}{path}", json=body)
         if response.status_code != httpx.codes.OK:
             raise LlmError(f"HTTP {response.status_code}: {response.text[:300]}")
         return response

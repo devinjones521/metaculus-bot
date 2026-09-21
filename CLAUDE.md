@@ -32,10 +32,19 @@ research record (window sweep, kill criteria K1–K4) stays in `../free money/fi
 1. **`llm_cost_usd` logs $0.00 while the balance falls** (the first forecast cost $0.93). The
    donated key returns no `usage.cost`. The budget guard reads the balance, so it is unaffected;
    the log is wrong. Derive per-sweep cost from the balance delta.
-2. **Comment privacy is unproven for MiniBench.** The 08-24 MiniBench comments read
-   `is_private: false`, while the 09-10 practice comment is private. Read the flag on the first
-   warmup comment (list with `?author=307009&is_private=true`; the plain listing hides private
-   comments, and `?on_post=` returns 403).
+2. **Every MiniBench comment this bot posts is private, and nothing has confirmed that scores.**
+   Measured 2026-09-21 on the warmup: all 21 comments read `is_private: true`, which is what the
+   code asks for — the 08-24 comments that read `is_private: false` came from the older rig. List
+   them with `?author=307009&is_private=true`; the plain listing hides private comments, and
+   `?on_post=` returns 403. What is still unknown is whether a private comment satisfies the
+   prize rule that asks for reasoning. Worth asking Metaculus before the Fall questions open.
+
+Fixed 2026-09-21: a dropped connection (`RemoteProtocolError`, which carries no status code)
+killed 4 of 9 MiniBench questions in the opening hour, because both venues retried on statuses
+only. Writes now resolve a drop — `submit` asks the server what landed before resending, `comment`
+resends — and a comment that dies after its forecast landed is logged and mailed as
+`comment_failed`, not as a failed question. q45942's lost comment was posted by hand; the design
+receipts are in `docs/METHOD.md`.
 
 Fixed 2026-09-10: Gemini 3.1 Pro's HTTP 429 (replaced by `gemini-3.8-flash`, evidence in
 `docs/METHOD.md`), and Grok is back as the fourth family, on the personal key.

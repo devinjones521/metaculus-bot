@@ -77,9 +77,14 @@ def answers_email(
     failed = [r for r in results if r.error and not r.error.startswith("skipped")]
     if not submitted and not failed:
         return None
+    uncommented = [r for r in submitted if r.comment_error]
     subject = f"devinjones-bot answered {_plural(len(submitted), 'question')} in {tournament}"
     if failed:
         subject += f", {len(failed)} FAILED"
+    # In the subject line because only a human can fix it, and only before the
+    # question closes: the bot will not revisit a question it has forecast.
+    if uncommented:
+        subject += f", {len(uncommented)} WITHOUT A COMMENT"
     lines = [
         f"{tournament}, sweep at {when:%Y-%m-%d %H:%M}Z: "
         f"{len(submitted)} submitted, {len(failed)} failed.",
@@ -95,6 +100,15 @@ def answers_email(
             f"   Answer: {result.answer or '(see the question page)'}",
             note,
             *(f"   dropped: {reason[:200]}" for reason in result.run_errors),
+            *(
+                [
+                    f"   NO COMMENT POSTED: {result.comment_error[:200]}",
+                    "   The forecast is in, but prizes need the reasoning, and no later",
+                    "   sweep will return to this question. Post it by hand.",
+                ]
+                if result.comment_error
+                else []
+            ),
             f"   {question_url(result.post_id)}",
             "",
         ]

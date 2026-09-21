@@ -48,6 +48,7 @@ class FakeClient:
         self.questions = questions
         self.standing = standing or set()
         self.submitted: list[Any] = []
+        self.submit_post_ids: list[int | None] = []
         self.comments: list[tuple[int, str]] = []
 
     def open_questions(self, tournament: str) -> list[Question]:
@@ -56,8 +57,9 @@ class FakeClient:
     def forecast_standing(self, post_id: int) -> set[int]:
         return self.standing
 
-    def submit(self, payloads: Any) -> None:
+    def submit(self, payloads: Any, *, post_id: int | None = None) -> None:
         self.submitted.extend(payloads)
+        self.submit_post_ids.append(post_id)
 
     def comment(self, post_id: int, text: str) -> None:
         self.comments.append((post_id, text))
@@ -484,3 +486,134 @@ def test_date_answers_read_as_dates_and_tails_keep_a_decimal() -> None:
     text = _describe_percentiles(_question(qtype="date"), stamps)
     assert text == f"median {day[0]} (80% range {day[1]}–{day[2]})"
     assert (_percent(0.3), _percent(0.015), _percent(0.985)) == ("30%", "1.5%", "98.5%")
+
+
+# --------------------------------------------------- submit and comment part ways
+#
+# 2026-09-21, MiniBench's opening hour: q45942's forecast reached Metaculus and
+# its comment did not. The row said `submitted: false, runs_ok: 0, FAILED`,
+# which is the shape of a question the bot never answered — so nobody looked,
+# and no sweep ever will: the standing forecast makes the next one skip it.
+
+
+class MuteClient(FakeClient):
+    """Takes the forecast, loses the comment."""
+
+    def comment(self, post_id: int, text: str) -> None:
+        raise RuntimeError("RemoteProtocolError: Server disconnected without sending a response.")
+
+
+class DeafClient(FakeClient):
+    """Loses the forecast itself."""
+
+    def submit(self, payloads: Any, *, post_id: int | None = None) -> None:
+        raise RuntimeError("RemoteProtocolError: Server disconnected without sending a response.")
+
+
+def test_a_lost_comment_is_not_a_lost_forecast() -> None:
+    client = MuteClient([_question()])
+    (result,) = run_tournament(
+        "minibench", client, _binary_llm, MODELS, "research-model", today=TODAY
+    )
+    assert result.submitted is True  # it IS on the board
+    assert result.error is None  # ...so this is not a failed question
+    assert result.comment_error is not None and "RemoteProtocolError" in result.comment_error
+    assert result.runs_ok == 3 and result.forecast == 0.30
+    assert client.submitted  # the forecast went, once
+
+
+def test_a_lost_submission_still_records_what_it_cost() -> None:
+    """Five runs were paid for before the write. A row that reports none of
+    them reads like a question the bot never got to."""
+    client = DeafClient([_question()])
+    (result,) = run_tournament(
+        "minibench", client, _binary_llm, MODELS, "research-model", today=TODAY
+    )
+    assert result.submitted is False
+    assert result.error is not None and "RemoteProtocolError" in result.error
+    assert result.comment_error is None  # it never got that far
+    assert result.runs_ok == 3 and result.forecast == 0.30
+    assert client.comments == []  # no reasoning posted for a forecast that is not there
+
+
+def test_the_venue_is_told_which_post_to_ask_about() -> None:
+    """The post id is what lets the venue ask the server whether a dropped
+    write landed, instead of resending one blind."""
+    client = FakeClient([_question()])
+    run_tournament("minibench", client, _binary_llm, MODELS, "research-model", today=TODAY)
+    assert client.submit_post_ids == [100]
+
+
+def test_a_rehearsal_withholds_the_post_id() -> None:
+    """Under --resubmit a standing forecast may predate the sweep, so it proves
+    nothing about this write and must not be read as proof."""
+    client = FakeClient([_question()], standing={42})
+    run_tournament(
+        "minibench",
+        client,
+        _binary_llm,
+        MODELS,
+        "research-model",
+        resubmit=True,
+        today=TODAY,
+    )
+    assert client.submit_post_ids == [None]
+
+
+def test_main_logs_an_uncommented_forecast_as_answered_and_says_so_out_loud(
+    tmp_path: Any, monkeypatch: Any, capsys: Any
+) -> None:
+    """Through main(), because the row and the summary are assembled there. The
+    question is answered, so it must not be counted as failed; the reasoning is
+    missing, so it must not be counted as done either."""
+    import json
+
+    from bot import forecast as fc
+
+    class FakeLlmClient:
+        total_cost_usd = 0.2
+        cost_by_model = {"model-a": 0.2}
+
+        def __init__(self, key: str, **kwargs: Any) -> None:
+            self.key = key
+
+        def models(self) -> set[str]:
+            return {"model-a", "model-b", "model-r"}
+
+        def complete(self, model: str, prompt: str, *, temperature: float = 1.0) -> str:
+            return _binary_llm(model, prompt, temperature=temperature)
+
+        def key_limits(self) -> dict[str, Any]:
+            return {"limit_remaining": 40.0}
+
+        def close(self) -> None:
+            return None
+
+    class ClosableMuteClient(MuteClient):
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setenv("METAC_FORECAST_MODELS", "model-a,model-b")
+    monkeypatch.setenv("METAC_RESEARCH_MODEL", "model-r")
+    monkeypatch.setattr(fc, "metaculus_token", lambda: "token")
+    monkeypatch.setattr(fc, "openrouter_key", lambda: "key")
+    monkeypatch.setattr(fc, "openrouter_personal_key", lambda: None)
+    monkeypatch.setattr(fc, "asknews_credentials", lambda: None)
+    monkeypatch.setattr(fc, "MetaculusClient", lambda token: ClosableMuteClient([_question()]))
+    monkeypatch.setattr("bot.venues.llm.OpenRouterClient", FakeLlmClient)
+    monkeypatch.setattr(fc, "FORECAST_LOG", tmp_path / "forecasts.jsonl")
+    monkeypatch.setattr(fc, "POLL_LOG", tmp_path / "polls.jsonl")
+
+    assert fc.main(["--tournament", "t"]) == 0
+
+    row = json.loads((tmp_path / "forecasts.jsonl").read_text(encoding="utf-8").splitlines()[0])
+    assert row["submitted"] is True and row["error"] is None
+    assert "RemoteProtocolError" in row["comment_error"]
+    assert row["forecast"] == 0.30  # the work is in the row, not only on Metaculus
+
+    poll = json.loads((tmp_path / "polls.jsonl").read_text(encoding="utf-8").splitlines()[0])
+    assert (poll["submitted"], poll["failed"], poll["comment_failed"]) == (1, 0, 1)
+
+    printed = capsys.readouterr().out
+    assert "NO COMMENT" in printed
+    assert "by hand" in printed  # nothing else will fix it
