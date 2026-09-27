@@ -62,3 +62,7 @@ Fixed 2026-09-10: Gemini 3.1 Pro's HTTP 429 (replaced by `gemini-3.8-flash`, evi
 - `bot.notify` mails the owner when a tournament opens (the first new questions after a quiet day)
   and, after every sweep that submitted or failed anything, what was answered. Each tournament's
   memory lives in `data/metaculus/notify-<slug>.json` on the box.
+- `bot.results` mails the owner each resolution: the outcome, the bot's answer and its spot peer
+  score, plus the cycle's running total with n and standard error. It checks hourly on every tick,
+  parked or not, and costs no model credit. Its memory is `data/metaculus/results-<slug>.json`.
+  Checked on the 08-24 cycle on 2026-09-27: +23.9/q, standard error 7.3, n=10, 50 missed.

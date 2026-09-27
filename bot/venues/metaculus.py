@@ -11,7 +11,8 @@ pool, and an unbroken bi-weekly $1k MiniBench. See `docs/METHOD.md`.
 WHAT CAN AND CANNOT HAPPEN THROUGH THIS FILE
 --------------------------------------------
 
-Reads: tournament question lists, question detail. Writes: probability forecasts
+Reads: tournament question lists, question detail, resolved questions and this
+account's scores on them. Writes: probability forecasts
 and reasoning comments on the bot account (`devinjones-bot`). **No money can move
 through this API.** Prize payout, if it ever happens, is a manual step on the
 account owner's side. There is no payment, order, or transfer surface here to guard, because none
@@ -44,6 +45,8 @@ from typing import Any
 
 import httpx
 
+from bot.cdf import unscaled_value
+
 API = "https://www.metaculus.com/api"
 DEFAULT_TIMEOUT = httpx.Timeout(30.0, connect=15.0)
 USER_AGENT = "metaculus-bot/0.2 (devinjones-bot; +https://github.com/devinjones521/metaculus-bot)"
@@ -60,6 +63,10 @@ CDF_POINTS = 201
 # Pagination pacing and the cap on honouring a server-sent Retry-After.
 PAGE_PAUSE_SECONDS = 2.0
 MAX_RETRY_AFTER_SECONDS = 120.0
+
+# A season is a few hundred questions; 20 pages of 100 is room to spare, and a
+# bound on a listing whose `next` link never ends (see `next_page_url`).
+MAX_RESOLVED_PAGES = 20
 
 # A connection that dies before the response carries no status code, so the
 # Retry-After path below never sees it. In the MiniBench opening hour on
@@ -178,6 +185,101 @@ def parse_posts(payload: Mapping[str, Any]) -> list[Question]:
                     question = _question_from_raw(post, raw)
                     if question is not None:
                         out.append(question)
+    return out
+
+
+@dataclass(frozen=True)
+class Resolution:
+    """One resolved question, as this account sees it.
+
+    Measured on the 2026-08-24 MiniBench (read 2026-09-27): the API shows
+    `resolution` only on questions this account forecast. On every other one
+    it was None, though they had resolved with ~150 forecasters each, so an
+    unanswered question's outcome is unknown here, not missing.
+    """
+
+    post_id: int
+    question_id: int
+    title: str
+    qtype: str
+    # The cycle it scores in. The warmup's is 33125 ("minibench"); the 08-24
+    # cycle's slug was renamed to "minibench-2026-08-24" after the fact, so the
+    # id is the stable key and the slug is only a label.
+    project_id: int | None
+    project: str
+    # "yes", "no", an option label, a number as text, "annulled", "ambiguous",
+    # "above_upper_bound", ... None when the API does not show it.
+    resolution: str | None
+    resolved_at: str
+    answered: bool
+    # Binary: P(yes). Multiple choice: {option: p}. Numeric, discrete, date:
+    # the median in real units (Unix seconds for dates). None if unanswered.
+    forecast: Any
+    # The leaderboard's score. The 08-24 run's nine scored questions average
+    # +23.8 on it, the figure this project has quoted as +23.9/q.
+    spot_peer: float | None
+    spot_baseline: float | None
+
+
+def _forecast_from(raw: Mapping[str, Any]) -> Any:
+    latest = (raw.get("my_forecasts") or {}).get("latest") or {}
+    values = latest.get("forecast_values")
+    qtype = raw.get("type")
+    if qtype == "binary" and isinstance(values, list) and len(values) == 2:
+        return float(values[1])  # [p(no), p(yes)]
+    if qtype == "multiple_choice" and isinstance(values, list):
+        options = [str(option) for option in raw.get("options") or []]
+        return dict(zip(options, (float(v) for v in values), strict=False))
+    centers = latest.get("centers")
+    scaling = raw.get("scaling") or {}
+    low, high = _float_or_none(scaling.get("range_min")), _float_or_none(scaling.get("range_max"))
+    if isinstance(centers, list) and centers and low is not None and high is not None:
+        # `centers` is the median's position on the [0, 1] axis: checked against
+        # the CDF's own 0.5 crossing on two 08-24 questions, to four places.
+        return unscaled_value(
+            float(centers[0]), low, high, _float_or_none(scaling.get("zero_point"))
+        )
+    return None
+
+
+def parse_resolutions(post: Mapping[str, Any]) -> list[Resolution]:
+    """The resolved questions in one post DETAIL payload.
+
+    Detail only: like `already_forecast`, a listing never carries
+    `my_forecasts`, and parsed from one every question reads unanswered.
+    """
+    raws: list[Mapping[str, Any]] = []
+    if isinstance(post.get("question"), Mapping):
+        raws.append(post["question"])
+    group = post.get("group_of_questions")
+    if isinstance(group, Mapping):
+        raws.extend(raw for raw in group.get("questions", []) if isinstance(raw, Mapping))
+    project = (post.get("projects") or {}).get("default_project") or {}
+    out: list[Resolution] = []
+    for raw in raws:
+        if raw.get("status") != "resolved" or raw.get("id") is None:
+            continue
+        my = raw.get("my_forecasts") or {}
+        scores = my.get("score_data") or {}
+        resolution = raw.get("resolution")
+        out.append(
+            Resolution(
+                post_id=int(post.get("id", 0)),
+                question_id=int(raw["id"]),
+                title=str(raw.get("title") or post.get("title") or ""),
+                qtype=str(raw.get("type") or ""),
+                project_id=int(project["id"]) if project.get("id") is not None else None,
+                project=str(project.get("slug") or ""),
+                resolution=None if resolution is None else str(resolution),
+                resolved_at=str(
+                    raw.get("resolution_set_time") or raw.get("actual_resolve_time") or ""
+                ),
+                answered=bool(my.get("latest")),
+                forecast=_forecast_from(raw),
+                spot_peer=_float_or_none(scores.get("spot_peer_score")),
+                spot_baseline=_float_or_none(scores.get("spot_baseline_score")),
+            )
+        )
     return out
 
 
@@ -301,6 +403,38 @@ class MetaculusClient:
             if url:
                 time.sleep(PAGE_PAUSE_SECONDS)
         return only_open(questions)
+
+    def resolved_post_ids(self, tournament: str) -> list[int]:
+        """Ids of the resolved posts in a tournament, across at most
+        MAX_RESOLVED_PAGES pages.
+
+        Ids only: the listing carries neither `my_forecasts` nor, for this
+        account, the outcome. `resolutions` reads those from the detail.
+        """
+        ids: list[int] = []
+        url: str | None = f"{API}/posts/"
+        params: dict[str, Any] | None = {
+            "tournaments": tournament,
+            "statuses": "resolved",
+            "limit": 100,
+            "with_cp": "false",
+        }
+        for _ in range(MAX_RESOLVED_PAGES):
+            if not url:
+                break
+            response = self._request("GET", url, params=params)
+            payload = response.json()
+            ids.extend(int(post["id"]) for post in payload.get("results", []) if "id" in post)
+            url = next_page_url(payload)
+            params = None
+            if url:
+                time.sleep(PAGE_PAUSE_SECONDS)
+        return ids
+
+    def resolutions(self, post_id: int) -> list[Resolution]:
+        """The resolved questions under one post, with this account's forecast and score."""
+        response = self._request("GET", f"{API}/posts/{post_id}/")
+        return parse_resolutions(response.json())
 
     def forecast_standing(self, post_id: int) -> set[int]:
         """Question ids under this post where THIS account has a forecast.

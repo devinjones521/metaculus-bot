@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import pytest
 
-from bot.cdf import DEFAULT_POINTS, build_cdf, scaled_location, validate_cdf
+from bot.cdf import DEFAULT_POINTS, build_cdf, scaled_location, unscaled_value, validate_cdf
 
 BRENT = {
     0.05: 62.0,
@@ -83,6 +83,15 @@ def test_values_beyond_range_are_survivable() -> None:
 def test_discrete_grid_size() -> None:
     cdf = build_cdf(BRENT, range_min=55.0, range_max=130.0, n_points=31)
     _assert_valid(cdf, lower_open=True, upper_open=True, n=31)
+
+
+@pytest.mark.parametrize("zero_point", [None, 0.0, -50.0])
+@pytest.mark.parametrize("value", [100.0, 250.0, 1000.0, 99999.0])
+def test_unscaled_value_inverts_scaled_location(value: float, zero_point: float | None) -> None:
+    """The results mail reads the bot's median back from the [0, 1] axis; a
+    wrong inverse would misreport every numeric answer, most on log scales."""
+    location = scaled_location(value, 100.0, 100000.0, zero_point)
+    assert unscaled_value(location, 100.0, 100000.0, zero_point) == pytest.approx(value)
 
 
 def test_log_scaled_location_is_not_linear() -> None:

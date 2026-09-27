@@ -76,6 +76,7 @@ from bot.forecast import (
     use_utf8_stdio,
 )
 from bot.notify import notify_sweep
+from bot.results import ResultsClient, check_results
 
 # Questions live ~3h, so any interval well under that sees every question with
 # most of its life left. 20 minutes costs one listing call per idle tick.
@@ -149,6 +150,7 @@ def poll(
     wait_at_floor: bool = False,
     alert: Callable[[dict[str, float | None]], list[str]] | None = None,
     notify: Callable[[str, list[ForecastResult]], list[str]] | None = None,
+    report: Callable[[str], list[str]] | None = None,
     now: Callable[[], dt.datetime] | None = None,
     sleep: Callable[[float], None] | None = None,
 ) -> PollOutcome:
@@ -195,6 +197,15 @@ def poll(
             for subject in alert(balances):
                 print(f"alert emailed: {subject}")
                 append_jsonl(POLL_LOG, row(credits_remaining=credit, alert=subject))
+        if report is not None:
+            # Every tick too: questions resolve whether or not there is money to
+            # forecast with, and a parked poller is the one nobody is watching.
+            try:
+                for subject in report(tournament):
+                    print(f"emailed: {subject}")
+                    append_jsonl(POLL_LOG, row(credits_remaining=credit, notified=subject))
+            except Exception as exc:  # noqa: BLE001 - a results bug must never cost a sweep
+                print(f"  RESULTS CHECK FAILED: {type(exc).__name__}: {exc}")
         cap = affordable_questions(credit, min_credit, cost_per_question)
         if cap is not None and cap < 1:
             floor = min_credit + cost_per_question
@@ -341,6 +352,7 @@ def main(argv: list[str] | None = None) -> int:
             wait_at_floor=args.wait_at_floor,
             alert=mail_alerter(args.min_credit, args.cost_per_question),
             notify=None if args.dry_run else mail_notifier(),
+            report=None if args.dry_run else mail_reporter(session.metaculus_client),
         )
     except KeyboardInterrupt:
         print("\ninterrupted — stopping after the current sweep.")
@@ -394,6 +406,22 @@ def mail_notifier() -> Callable[[str, list[ForecastResult]], list[str]] | None:
 
     print("answer emails ON: tournament openings and every sweep's answers.")
     return notify
+
+
+def mail_reporter(client: ResultsClient) -> Callable[[str], list[str]] | None:
+    """The per-tick hook that mails resolutions and scores, or None without mail."""
+    settings = alert_mail_settings()
+    if settings is None:
+        return None
+    from bot.venues.mail import send_mail
+
+    send = functools.partial(send_mail, settings)
+
+    def report(tournament: str) -> list[str]:
+        return check_results(tournament, client, send, now=dt.datetime.now(dt.UTC))
+
+    print("result emails ON: each resolution and its score, checked hourly.")
+    return report
 
 
 if __name__ == "__main__":

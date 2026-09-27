@@ -73,6 +73,7 @@ The donated key's "empty" is exactly the point at which the poller parks and sto
 With the same settings, the poller also emails you what it does:
 - **When a tournament opens:** the first new questions after at least a day with none, e.g. a MiniBench cycle starting.
 - **After every sweep that submitted or failed anything:** each question, its link, the forecast in words ("37%", "median 6,512 (80% range 6,380–6,650)"), and how many of the five models contributed.
+- **When questions resolve:** once an hour, parked or not, the poller looks for newly resolved questions. You get one mail per batch. For each question it shows the outcome, what the bot said, and its spot peer score (the leaderboard's score). Questions that resolved without a forecast are listed as missed. The mail ends with the cycle's running total: n, average, and standard error. A question whose score Metaculus hasn't posted yet is held back for up to 48 hours, then reported as unscored.
 
 A sweep that did nothing sends nothing, and dry runs never send.
 

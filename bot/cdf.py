@@ -72,6 +72,20 @@ def scaled_location(
     return math.log(numerator) / math.log(denominator)
 
 
+def unscaled_value(
+    location: float, range_min: float, range_max: float, zero_point: float | None
+) -> float:
+    """The inverse of `scaled_location`: a point on the [0, 1] axis, in real units."""
+    if range_max <= range_min:
+        raise ValueError(f"degenerate range [{range_min}, {range_max}]")
+    if zero_point is None:
+        return range_min + location * (range_max - range_min)
+    if zero_point >= range_min:
+        raise ValueError(f"zero_point {zero_point} not below range_min {range_min}")
+    ratio = (range_max - zero_point) / (range_min - zero_point)
+    return zero_point + (range_min - zero_point) * math.pow(ratio, location)
+
+
 def build_cdf(
     percentile_values: Mapping[float, float],
     *,

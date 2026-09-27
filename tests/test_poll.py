@@ -45,6 +45,7 @@ def _no_writes_to_real_data(tmp_path: Any, monkeypatch: Any) -> None:
     monkeypatch.setattr("bot.alerts.STATE_PATH", tmp_path / "alerts.json")
     monkeypatch.setattr("bot.forecast.openrouter_personal_key", lambda: None)
     monkeypatch.setattr("bot.notify.STATE_DIR", tmp_path)
+    monkeypatch.setattr("bot.results.STATE_DIR", tmp_path)
 
 
 class FakeSession:
@@ -56,6 +57,7 @@ class FakeSession:
         self._credits = credits if isinstance(credits, list) else [credits]
         self.personal = personal
         self.closed = False
+        self.metaculus_client = None  # handed to the results hook, never called here
 
     def credits_remaining(self) -> float | None:
         return self._credits[0] if len(self._credits) == 1 else self._credits.pop(0)
@@ -605,3 +607,78 @@ def test_main_wires_the_notifier_only_with_mail_and_never_on_a_dry_run(monkeypat
     assert callable(seen["notify"])
     assert bp.main(["--hours", "1", "--dry-run"]) == 0
     assert seen["notify"] is None  # a rehearsal must never mail "answered"
+
+
+# ------------------------------------------------------ results by mail
+#
+# 2026-09-27: results reached the owner only if someone went and looked. The
+# hook runs every tick, because the donated key was ~13 questions from the
+# floor, and a parked poller does not sweep.
+
+
+def test_the_results_hook_runs_every_tick_even_while_parked(tmp_path: Any) -> None:
+    checked: list[str] = []
+
+    def report(tournament: str) -> list[str]:
+        checked.append(tournament)
+        return ["devinjones-bot: 1 result in minibench"] if len(checked) == 2 else []
+
+    clock = FakeClock()
+    bp.poll(
+        FakeSession(credits=5.0),
+        "minibench",
+        until=START + dt.timedelta(minutes=60),
+        interval_seconds=20 * 60,
+        wait_at_floor=True,
+        report=report,
+        now=clock,
+        sleep=clock.sleep,
+    )
+
+    assert checked == ["minibench"] * 3
+    notified = [r.get("notified") for r in _rows(tmp_path / "polls.jsonl") if "notified" in r]
+    assert notified == ["devinjones-bot: 1 result in minibench"]
+
+
+def test_a_broken_results_check_never_costs_a_sweep(tmp_path: Any, monkeypatch: Any) -> None:
+    swept: list[int] = []
+    monkeypatch.setattr(bp, "sweep_and_log", lambda *a, **k: (swept.append(1), _summary())[1])
+
+    def report(tournament: str) -> list[str]:
+        raise RuntimeError("metaculus.com unreachable")
+
+    clock = FakeClock()
+    outcome = bp.poll(
+        FakeSession(),
+        "minibench",
+        until=START + dt.timedelta(minutes=60),
+        interval_seconds=20 * 60,
+        report=report,
+        now=clock,
+        sleep=clock.sleep,
+    )
+    assert len(swept) == 3 and outcome.submitted == 3
+
+
+def test_main_wires_the_results_hook_only_with_mail_and_never_on_a_dry_run(
+    monkeypatch: Any,
+) -> None:
+    from bot.config import MailSettings
+
+    seen: dict[str, Any] = {}
+
+    def fake_poll(session: Any, tournament: str, **kwargs: Any) -> Any:
+        seen.update(kwargs)
+        return bp.PollOutcome(0, 0, "deadline reached")
+
+    monkeypatch.setattr(bp, "build_session", lambda dry_run: FakeSession())
+    monkeypatch.setattr(bp, "poll", fake_poll)
+
+    assert bp.main(["--hours", "1"]) == 0
+    assert seen["report"] is None
+    settings = MailSettings(user="bot@example.com", password="fake", to="me@example.com")
+    monkeypatch.setattr(bp, "alert_mail_settings", lambda: settings)
+    assert bp.main(["--hours", "1"]) == 0
+    assert callable(seen["report"])
+    assert bp.main(["--hours", "1", "--dry-run"]) == 0
+    assert seen["report"] is None
