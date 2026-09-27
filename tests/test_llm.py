@@ -75,3 +75,83 @@ def test_the_status_retry_still_works(monkeypatch: pytest.MonkeyPatch) -> None:
     wire = _Wire([httpx.Response(503, text="high demand"), httpx.Response(200, json=COMPLETION)])
     assert wire.client().complete("google/gemini-3.8-flash", "prompt") == "Probability: 30%"
     assert wire.attempts == 2
+
+
+# ------------------------------------------------ the provider's own words
+#
+# 2026-09-27: twelve warmup runs had been logged as "empty completion". Probed,
+# they were Google's "high demand" sent as HTTP 200 with the error inside the
+# choice. And every quota 429 was cut off in the log before the part naming
+# the quota, behind ~300 characters of OpenRouter's envelope.
+
+HIGH_DEMAND_IN_BAND = {
+    "choices": [
+        {
+            "message": {"content": ""},
+            "finish_reason": "error",
+            "error": {
+                "code": 502,
+                "message": "This model is currently experiencing high demand.",
+                "metadata": {"error_type": "provider_unavailable"},
+            },
+        }
+    ],
+    "usage": {"cost": 0, "is_byok": True},
+}
+
+GOOGLE_RAW_429 = (
+    '{\n  "error": {\n    "code": 429,\n    "message": "You exceeded your current quota, '
+    "please check your plan and billing details. For more information on this error, head "
+    "to: https://ai.google.dev/gemini-api/docs/rate-limits.\\n* Quota exceeded for metric: "
+    "generativelanguage.googleapis.com/generate_content_paid_tier_requests, limit: 150, "
+    'model: gemini-3.8-flash",\n    "status": "RESOURCE_EXHAUSTED"\n  }\n}\n'
+)
+
+GOOGLE_QUOTA_429 = {
+    "error": {
+        "message": "Provider returned error",
+        "code": 429,
+        "metadata": {
+            "raw": GOOGLE_RAW_429,
+            "provider_name": "Google AI Studio",
+            "is_byok": True,
+        },
+    }
+}
+
+
+def test_an_in_band_provider_error_is_named_not_called_empty() -> None:
+    wire = _Wire([httpx.Response(200, json=HIGH_DEMAND_IN_BAND)])
+    with pytest.raises(LlmError) as raised:
+        wire.client().complete("google/gemini-3.8-flash", "prompt")
+    message = str(raised.value)
+    assert "high demand" in message and "502" in message
+    assert "empty completion" not in message
+
+
+def test_a_completion_cut_off_at_max_tokens_is_raised_not_parsed() -> None:
+    """Cut off mid-thought, with a bare percentage in it that the binary parser
+    would otherwise have taken for the answer."""
+    truncated = {
+        "choices": [
+            {
+                "message": {"content": "Base rate is about 20% in October. But wait! If"},
+                "finish_reason": "length",
+            }
+        ]
+    }
+    wire = _Wire([httpx.Response(200, json=truncated)])
+    with pytest.raises(LlmError, match="max_tokens"):
+        wire.client().complete("google/gemini-3.5-flash", "prompt")
+
+
+def test_a_quota_429_leads_with_the_quota_it_names(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(time, "sleep", lambda _: None)
+    wire = _Wire([httpx.Response(429, json=GOOGLE_QUOTA_429)])
+    with pytest.raises(LlmError) as raised:
+        wire.client().complete("google/gemini-3.8-flash", "prompt")
+    message = str(raised.value)
+    assert message.startswith("HTTP 429 from Google AI Studio: Quota exceeded for metric")
+    # The pipeline keeps 240 characters of a run's error; the quota must be in them.
+    assert "model: gemini-3.8-flash" in message[:240]
+    assert "You exceeded your current quota" in message  # the rest is kept, after it

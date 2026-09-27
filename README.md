@@ -57,6 +57,10 @@ run therefore goes to `OPENROUTER_PERSONAL_KEY`, your own key; everything else, 
 included, stays on the donated one. Without a personal key, Grok is dropped from the roster at
 startup and the ensemble runs on four models.
 
+Gemini runs on the donated key, where Metaculus's own Google account pays for it. When that fails
+(a quota 429, "high demand", a dropped connection), the run is tried once more on the personal key,
+at about $0.01. Without a personal key there is no second try.
+
 ### Funding alerts
 
 With `ALERT_SMTP_USER` and `ALERT_SMTP_PASSWORD` (a Gmail app password) set, the poller emails

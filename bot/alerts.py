@@ -17,7 +17,8 @@ buys is lead time to top up.
 There are two keys, because the roster spans two (see `bot.forecast`):
 
   donated   research and four ensemble runs. Empty means NO forecasts at all.
-  personal  Grok only. Empty means a four-model ensemble, not a stop.
+  personal  Grok, and Gemini's second route when the donated one fails. Empty
+            means a four-model ensemble (three when Gemini fails too), not a stop.
 
 LEVELS
 ------
@@ -68,10 +69,13 @@ LEVELS = (OK, LOW, OUT)
 # busiest time. Chosen, not derived.
 LOW_QUESTIONS = 25
 
-# The personal key pays for Grok alone. Measured 2026-08-24: grok-4.6 cost $0.34
-# across 11 questions. Its max_tokens=8000 reservation is $0.048 (OpenRouter
-# pricing, 2026-09-10); below that every Grok run 402s.
-GROK_COST_PER_QUESTION_USD = 0.03
+# The personal key pays for Grok, and for Gemini whenever the donated route
+# fails. Measured: Grok alone cost $0.94 over the 38 warmup questions after
+# 2026-09-21 midday ($0.025/q); a fallback Gemini run cost $0.009-0.010 on
+# 2026-09-27 (n=2), and the donated route failed on 51 of 60 questions. Grok's
+# max_tokens=8000 reservation is $0.048 (OpenRouter pricing, 2026-09-10); below
+# that every Grok run 402s.
+PERSONAL_COST_PER_QUESTION_USD = 0.035
 GROK_FLOOR_USD = 0.05
 
 
@@ -118,9 +122,10 @@ def funding_wallets(min_credit: float, cost_per_question: float) -> dict[str, Wa
             name="personal",
             label="personal key (Grok)",
             floor=GROK_FLOOR_USD,
-            per_question=GROK_COST_PER_QUESTION_USD,
-            when_empty="Grok's runs fail and each question runs on four models; forecasting "
-            "continues.",
+            per_question=PERSONAL_COST_PER_QUESTION_USD,
+            when_empty="Grok's runs fail, and so does Gemini's second route: each question "
+            "runs on four models, or three when Gemini's donated route fails too; "
+            "forecasting continues.",
             to_fix="top up at https://openrouter.ai/settings/credits. Nothing needs redeploying.",
         ),
     }

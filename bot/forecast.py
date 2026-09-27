@@ -107,6 +107,8 @@ POLL_LOG = DATA_DIR / "polls.jsonl"
 # its slot (evidence in docs/METHOD.md). Fable is sampled twice on purpose, and
 # first, because the extremeness check runs on models[0]. Grok needs
 # OPENROUTER_PERSONAL_KEY (see PERSONAL_KEY_PROVIDERS) and is dropped without it.
+# Gemini is tried on the donated key and, when that fails, once more on the
+# personal key (see FALLBACK_TO_PERSONAL_KEY).
 # Overridable via METAC_FORECAST_MODELS / METAC_RESEARCH_MODEL without a code
 # change, and validated against the live OpenRouter id list at startup so a
 # typo fails before question one, not during question five.
@@ -174,6 +176,9 @@ class ForecastResult:
     runs_failed: int = 0
     suspect: bool = False
     run_errors: list[str] = field(default_factory=list)
+    # Runs that failed on the donated key and then answered on the personal
+    # one: not dropped, but not healthy either (see FALLBACK_TO_PERSONAL_KEY).
+    fallbacks: list[str] = field(default_factory=list)
     error: str | None = None
     # Set when the forecast went in but its reasoning did not. Separate from
     # `error`, which means nothing was submitted: a question that is answered
@@ -256,38 +261,50 @@ def forecast_question(
     models: tuple[str, ...],
     research: str,
     today: str,
-) -> tuple[dict[str, Any], str, int, int, bool, list[str], str]:
+    *,
+    fallback: Callable[..., str] | None = None,
+) -> tuple[dict[str, Any], str, int, int, bool, list[str], str, list[str]]:
     """One question through ensemble → aggregate → payload.
 
-    Returns (payload, rationale, runs_ok, runs_failed, suspect, run_errors, answer).
-    Raises only if NO run parsed — the caller records that as a loud failure.
+    Returns (payload, rationale, runs_ok, runs_failed, suspect, run_errors,
+    answer, fallbacks). Raises only if NO run parsed — the caller records that
+    as a loud failure.
 
     Every dropped run's reason is kept and returned, because a dropped run costs
     ensemble breadth whether or not the question survives. On 2026-08-24 three
     forecasts went in on a thinned ensemble and two questions died outright,
     while the reasons — plain HTTP 402 'out of credits' — were discarded right
     here, leaving 'all 5 ensemble runs failed' as the only surviving evidence.
+
+    A run on a FALLBACK_TO_PERSONAL_KEY model that fails is tried once more
+    through `fallback`. One that then answers is not a dropped run, but its
+    first failure is returned in `fallbacks`, so a slot that only ever answers
+    on its second route stays visible instead of reading as healthy.
     """
     runs: list[Any] = []
     rationales: list[str] = []
     run_errors: list[str] = []
+    fallbacks: list[str] = []
     for model in models:
         try:
-            if question.qtype == "binary":
-                text = llm(model, binary_prompt(question, research, today))
-                runs.append(parse_binary(text))
-            elif question.qtype == "multiple_choice":
-                text = llm(model, multiple_choice_prompt(question, research, today))
-                runs.append(parse_multiple_choice(text, question.options))
-            elif question.qtype in ("numeric", "discrete", "date"):
-                text = llm(model, numeric_prompt(question, research, today))
-                runs.append(parse_numeric(text))
-            else:
-                raise ParseError(f"unhandled question type {question.qtype!r}")
+            text, run = _one_run(question, llm, model, research, today)
             rationales.append(f"### Run ({model})\n{text.strip()}")
+            runs.append(run)
+            continue
         except Exception as exc:  # noqa: BLE001 - a bad run is dropped, loudly
-            run_errors.append(f"{model}: {type(exc).__name__}: {exc}"[:MAX_RUN_ERROR_CHARS])
-            rationales.append(f"### Run ({model}) FAILED: {exc}")
+            why = f"{type(exc).__name__}: {exc}"[:MAX_RUN_ERROR_CHARS]
+        if fallback is not None and falls_back_to_personal_key(model):
+            try:
+                text, run = _one_run(question, fallback, model, research, today)
+                rationales.append(f"### Run ({model}, second route)\n{text.strip()}")
+                runs.append(run)
+                fallbacks.append(f"{model}: {why}")
+                continue
+            except Exception as exc:  # noqa: BLE001 - both routes failed; both reasons kept
+                second = f"{type(exc).__name__}: {exc}"[:MAX_RUN_ERROR_CHARS]
+                why = f"{why} | then on the personal key: {second}"
+        run_errors.append(f"{model}: {why}")
+        rationales.append(f"### Run ({model}) FAILED: {why}")
     if not runs:
         raise RuntimeError(f"all {len(models)} ensemble runs failed — " + " | ".join(run_errors))
 
@@ -333,7 +350,27 @@ def forecast_question(
         payload = numeric_payload(question.question_id, cdf, question.cdf_points)
 
     rationale = "\n\n".join(rationales)[:MAX_COMMENT_CHARS]
-    return payload, rationale, len(runs), len(run_errors), suspect, run_errors, answer
+    return payload, rationale, len(runs), len(run_errors), suspect, run_errors, answer, fallbacks
+
+
+def _one_run(
+    question: Question,
+    llm: Callable[..., str],
+    model: str,
+    research: str,
+    today: str,
+) -> tuple[str, Any]:
+    """One model's answer and its parse. Raises on either failing."""
+    if question.qtype == "binary":
+        text = llm(model, binary_prompt(question, research, today))
+        return text, parse_binary(text)
+    if question.qtype == "multiple_choice":
+        text = llm(model, multiple_choice_prompt(question, research, today))
+        return text, parse_multiple_choice(text, question.options)
+    if question.qtype in ("numeric", "discrete", "date"):
+        text = llm(model, numeric_prompt(question, research, today))
+        return text, parse_numeric(text)
+    raise ParseError(f"unhandled question type {question.qtype!r}")
 
 
 def run_tournament(
@@ -348,6 +385,7 @@ def run_tournament(
     resubmit: bool = False,
     limit: int | None = None,
     today: str | None = None,
+    fallback: Callable[..., str] | None = None,
 ) -> list[ForecastResult]:
     """Sweep one tournament. One question's failure never stops the sweep."""
     today = today or dt.date.today().isoformat()
@@ -394,8 +432,8 @@ def run_tournament(
         )
         try:
             research = gather_research(question, llm, research_model, asknews_search, today)
-            payload, rationale, ok, failed, suspect, run_errors, answer = forecast_question(
-                question, llm, models, research, today
+            (payload, rationale, ok, failed, suspect, run_errors, answer, fallbacks) = (
+                forecast_question(question, llm, models, research, today, fallback=fallback)
             )
             # Written down BEFORE the network call. When a submission died on
             # the wire on 2026-09-21 the row read `runs_ok: 0, forecast: null`,
@@ -404,6 +442,7 @@ def run_tournament(
             result.forecast = _summarise_payload(payload)
             result.runs_ok, result.runs_failed, result.suspect = ok, failed, suspect
             result.run_errors = run_errors
+            result.fallbacks = fallbacks
             result.answer = answer
             # Under `resubmit` a standing forecast may predate this sweep, so it
             # cannot tell the venue whether a dropped write landed.
@@ -491,6 +530,23 @@ def needs_personal_key(model: str) -> bool:
     return model.startswith(PERSONAL_KEY_PROVIDERS)
 
 
+# Models that run on the donated key first and, when that fails, once more on
+# the personal key. The donated key reaches Gemini through Metaculus's own
+# Google account (`is_byok: true`, $0 to this bot), and that route failed 50
+# times in the 60 warmup questions of 2026-09-21..23: 32 quota 429s, 12
+# in-band "high demand" errors that were logged as empty completions, and 6
+# dropped connections. Gemini 3.5 Flash is no way round it: probed on
+# 2026-09-27, it failed on the same route in the same minutes (3 of 3, "high
+# demand") as 3.8 did (4 of 4). The personal key reaches the same model through
+# OpenRouter's own Google capacity, and answered 2 of 2 in the minute the
+# donated route refused, at about $0.01 a run.
+FALLBACK_TO_PERSONAL_KEY = ("google/",)
+
+
+def falls_back_to_personal_key(model: str) -> bool:
+    return model.startswith(FALLBACK_TO_PERSONAL_KEY)
+
+
 def _balance(llm_client: Any) -> float | None:
     """Dollars left on one OpenRouter key, or None if the key won't say.
 
@@ -525,6 +581,8 @@ class Session:
     metaculus_client: Any
     # The owner's own key, for PERSONAL_KEY_PROVIDERS. None when it is not set.
     personal_llm_client: Any = None
+    # The second route for FALLBACK_TO_PERSONAL_KEY models. None without that key.
+    fallback_llm: Callable[..., str] | None = None
 
     def credits_remaining(self) -> float | None:
         """Dollars left on the donated key, which pays for research and most runs."""
@@ -588,9 +646,15 @@ def build_session(*, dry_run: bool = False) -> Session:
                 f"{', '.join(PERSONAL_KEY_PROVIDERS)} models."
             )
     on_personal = sorted({m for m in models if needs_personal_key(m)})
+    second_route = sorted({m for m in models if falls_back_to_personal_key(m)})
     print(
         f"roster: {', '.join(models)}"
         + (f" ({', '.join(on_personal)} on the personal key)" if on_personal else "")
+        + (
+            f"; {', '.join(second_route)} falls back to the personal key"
+            if second_route and personal_client
+            else ""
+        )
     )
 
     def llm(model: str, prompt: str, *, temperature: float = 1.0) -> str:
@@ -617,6 +681,7 @@ def build_session(*, dry_run: bool = False) -> Session:
         asknews_search=asknews,
         metaculus_client=live_client,
         personal_llm_client=personal_client,
+        fallback_llm=personal_client.complete if personal_client else None,
     )
 
 
@@ -633,14 +698,15 @@ class SweepSummary:
 def _spend(session: Session) -> tuple[float, dict[str, float]]:
     """Running cost across both keys' clients: the total, and per model.
 
-    The two clients never serve the same model, so merging per-model dicts
-    cannot double-count.
+    Summed per model, not merged: a FALLBACK_TO_PERSONAL_KEY model is served
+    by both clients, and a merge would keep only one key's share.
     """
     total = 0.0
     by_model: dict[str, float] = {}
     for llm_client in session.llm_clients():
         total += float(getattr(llm_client, "total_cost_usd", 0.0))
-        by_model.update(dict(getattr(llm_client, "cost_by_model", {})))
+        for model, cost in dict(getattr(llm_client, "cost_by_model", {})).items():
+            by_model[model] = by_model.get(model, 0.0) + float(cost)
     return total, by_model
 
 
@@ -676,6 +742,7 @@ def sweep_and_log(
         already_done=previously_forecast_ids(),
         resubmit=resubmit,
         limit=limit,
+        fallback=session.fallback_llm,
     )
 
     submitted = sum(1 for r in results if r.submitted)
@@ -696,6 +763,7 @@ def sweep_and_log(
             "runs_failed": result.runs_failed,
             "suspect": result.suspect,
             "run_errors": result.run_errors,
+            "fallbacks": result.fallbacks,
             "error": result.error,
             "comment_error": result.comment_error,
         }
@@ -752,6 +820,14 @@ def sweep_and_log(
             )
             for reason in result.run_errors:
                 print(f"      {reason}")
+    # Whole ensembles, but only because the second route answered. Quieter
+    # than THINNED and printed all the same: without it a slot that fails
+    # every time on the donated key looks exactly like a healthy one.
+    for result in results:
+        if result.submitted and result.fallbacks:
+            print(f"  FELL BACK {result.question_id} {result.title[:50]}: personal key answered")
+            for reason in result.fallbacks:
+                print(f"      donated key: {reason}")
     return SweepSummary(
         seen=len(results),
         submitted=submitted,

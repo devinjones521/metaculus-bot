@@ -617,3 +617,104 @@ def test_main_logs_an_uncommented_forecast_as_answered_and_says_so_out_loud(
     printed = capsys.readouterr().out
     assert "NO COMMENT" in printed
     assert "by hand" in printed  # nothing else will fix it
+
+
+# ------------------------------------------------ Gemini's second route
+#
+# 2026-09-21..23: the donated key's Gemini route failed on 51 of 60 warmup
+# questions (quota 429s, in-band "high demand", dropped connections), so each
+# of them ran on four models. On 2026-09-27 the personal key answered in the
+# same minute the donated route refused. A failed Gemini run is now tried once
+# more there.
+
+GEMINI = "google/gemini-test"
+FALLBACK_MODELS = ("model-a", GEMINI)
+
+
+def _gemini_refused(model: str, prompt: str, *, temperature: float = 1.0) -> str:
+    if model == GEMINI:
+        raise RuntimeError("HTTP 429 from Google AI Studio: Quota exceeded for metric")
+    return _binary_llm(model, prompt, temperature=temperature)
+
+
+def test_a_failed_gemini_run_answers_on_the_second_route() -> None:
+    second: list[str] = []
+
+    def personal(model: str, prompt: str, *, temperature: float = 1.0) -> str:
+        second.append(model)
+        return "Reasoning...\nProbability: 40%"
+
+    _, rationale, ok, failed, _, run_errors, _, fallbacks = forecast_question(
+        _question(), _gemini_refused, FALLBACK_MODELS, "brief", TODAY, fallback=personal
+    )
+    assert (ok, failed) == (2, 0)  # the whole ensemble, not a thinned one
+    assert second == [GEMINI]
+    assert run_errors == []
+    assert len(fallbacks) == 1 and GEMINI in fallbacks[0] and "Quota" in fallbacks[0]
+    assert f"### Run ({GEMINI}, second route)" in rationale
+
+
+def test_when_both_routes_fail_the_run_is_dropped_with_both_reasons() -> None:
+    def personal(model: str, prompt: str, *, temperature: float = 1.0) -> str:
+        raise RuntimeError("HTTP 402: requires more credits")
+
+    _, _, ok, failed, _, run_errors, _, fallbacks = forecast_question(
+        _question(), _gemini_refused, FALLBACK_MODELS, "brief", TODAY, fallback=personal
+    )
+    assert (ok, failed) == (1, 1)
+    assert fallbacks == []
+    (reason,) = run_errors
+    assert "Quota" in reason and "then on the personal key" in reason and "HTTP 402" in reason
+
+
+def test_only_fallback_models_get_a_second_route() -> None:
+    """A failed Fable or GPT run stays failed: the second route is for the slot
+    whose donated route is Metaculus's shared Google quota, and nothing else."""
+    second: list[str] = []
+
+    def personal(model: str, prompt: str, *, temperature: float = 1.0) -> str:
+        second.append(model)
+        return "Probability: 40%"
+
+    _, _, ok, failed, _, run_errors, _, _ = forecast_question(
+        _question(), _credit_starved_llm, MODELS, "brief", TODAY, fallback=personal
+    )
+    assert second == []
+    assert (ok, failed) == (2, 1) and "model-b" in run_errors[0]
+
+
+def test_main_sends_a_refused_gemini_run_to_the_personal_key_and_says_so(
+    tmp_path: Any, monkeypatch: Any, capsys: Any
+) -> None:
+    """Driven through main(), where the second route is wired up and the row,
+    the printout and the per-model cost are assembled."""
+
+    class RefusingDonatedClient(KeyedLlmClient):
+        def models(self) -> set[str]:
+            return {"model-a", GEMINI, "model-r"}
+
+        def complete(self, model: str, prompt: str, *, temperature: float = 1.0) -> str:
+            KeyedLlmClient.served.append((self.key, model))
+            self.cost_by_model[model] = self.cost_by_model.get(model, 0.0) + 0.01
+            if self.key == "donated" and model == GEMINI:
+                raise RuntimeError("provider error 502 in the completion: high demand")
+            return _binary_llm(model, prompt, temperature=temperature)
+
+    fc = _two_key_env(monkeypatch, tmp_path, personal="personal")
+    monkeypatch.setenv("METAC_FORECAST_MODELS", f"model-a,{GEMINI}")
+    monkeypatch.setattr("bot.venues.llm.OpenRouterClient", RefusingDonatedClient)
+
+    assert fc.main(["--tournament", "t"]) == 0
+
+    served = KeyedLlmClient.served
+    assert ("donated", GEMINI) in served and ("personal", GEMINI) in served
+    assert served.index(("donated", GEMINI)) < served.index(("personal", GEMINI))
+    row = _first_row(tmp_path / "forecasts.jsonl")
+    assert (row["runs_ok"], row["runs_failed"]) == (2, 0)
+    assert len(row["fallbacks"]) == 1 and "high demand" in row["fallbacks"][0]
+    printed = capsys.readouterr().out
+    assert "FELL BACK" in printed and "high demand" in printed
+    assert f"{GEMINI} falls back to the personal key" in printed
+    # Both keys served Gemini; the per-model cost is their sum, not either one.
+    poll_row = _first_row(tmp_path / "polls.jsonl")
+    assert poll_row["llm_cost_by_model"][GEMINI] == 0.02

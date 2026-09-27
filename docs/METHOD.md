@@ -53,6 +53,46 @@ No forecasting score exists for 3.8 Flash itself yet. The first warmup sweeps ar
 OpenAI, Anthropic and Google (measured 2026-09-10: HTTP 404 on `x-ai/*`). Without that key the
 roster drops Grok at startup rather than failing it on every question.
 
+### Gemini's second route (2026-09-27)
+
+In the warmup MiniBench (2026-09-21..23, 60 questions), the Gemini run failed on 51 questions.
+Nothing else failed at all. So in effect every question ran on four models over three families,
+which is not the roster the +23.9/q came from. The 50 failures of 3.8 Flash:
+
+| failure | n | what it was |
+|---|---|---|
+| HTTP 429 "You exceeded your current quota" | 32 | Google's quota, on Metaculus's own Google account |
+| "empty completion" | 12 | Google's "high demand", sent as HTTP 200 with the error inside the choice |
+| dropped connection | 6 | `RemoteProtocolError`, no status |
+
+Probed on 2026-09-27, with a real forecasting prompt:
+
+- **The donated key reaches Gemini through Metaculus's Google account.** Every response read
+  `is_byok: true` and `cost: 0`, and the balance did not move. Gemini has cost this bot nothing.
+  The quota it runs into is shared with every other bot on the same donated keys.
+- **Another Gemini model on the same route is no way round it.** Gemini 3.5 Flash (the house-bot
+  record the handover had picked as the fallback) failed 3 of 3 with "high demand" in the same
+  minutes 3.8 Flash failed 4 of 4.
+- **The personal key reaches the same model through OpenRouter's own Google capacity**, not
+  Metaculus's quota. It answered 2 of 2 in the minute the donated route refused 1 of 1, at
+  $0.009 and $0.010 a run. n=2, so this is only a first measurement.
+
+So the Gemini slot runs on the donated key first, where it is free, and a run that fails there is
+tried once more on the personal key (`FALLBACK_TO_PERSONAL_KEY` in `bot/forecast.py`). A run that
+answers on the second route is not a dropped run, but it is not a healthy one either. It goes into
+the row's `fallbacks` field, onto a `FELL BACK` line in the sweep output, and into the answer
+email, so a slot that only ever answers on its second route stays visible.
+
+Found on the way, and fixed with it:
+
+- the in-band error is now reported in the provider's words, not as "empty completion";
+- a quota 429 leads with the quota it names, because the log keeps only 240 characters, and
+  ~300 characters of OpenRouter's wrapper came first;
+- a completion that stopped at `max_tokens` is raised, not parsed. 3.5 Flash spent 7,680 of its
+  8,000 tokens thinking on one probe and stopped mid-sentence. The binary parser falls back to
+  the last bare "NN%" in the text, so a sentence cut off mid-thought could have been submitted
+  as a forecast.
+
 ## What the wire does, and what the bot does about it
 
 Measured on 2026-09-21, MiniBench's opening hour: four questions out of nine died with
@@ -108,8 +148,10 @@ and it is not a verdict on its own.
 Operating costs, as measured: about **$1.15 per question** on OpenRouter, of which research is
 about 64%. OpenRouter reserves `max_tokens × output price` against the balance, so below about
 $8.50 every ensemble call fails with HTTP 402 before generating anything. `bot.poll` stops
-spending before that point, and `bot.alerts` emails the owner well before it gets there. Grok,
-on the personal key, costs about $0.03 per question.
+spending before that point, and `bot.alerts` emails the owner well before it gets there. The
+personal key pays for Grok (measured $0.025 per question, n=38) and for Gemini's second route
+(about $0.01 a run, n=2): about $0.035 per question in all while the donated Gemini route keeps
+failing.
 
 ## Sources
 

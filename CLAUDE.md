@@ -54,7 +54,9 @@ Fixed 2026-09-10: Gemini 3.1 Pro's HTTP 429 (replaced by `gemini-3.8-flash`, evi
   MiniBench, raised automatically on above-average MiniBench performance, ~2x for open-source bots.
   Its account allows only openai, anthropic and google-ai-studio. Usable = balance − ~$8.50 (the
   `max_tokens=8000` reservation 402s below that). Measured cost ~$1.15/question, ~64% research.
-- `OPENROUTER_PERSONAL_KEY` is the owner's own, and pays for `x-ai/*` (Grok) only, ~$0.03/question.
+- `OPENROUTER_PERSONAL_KEY` is the owner's own. It pays for `x-ai/*` (Grok, ~$0.025/question),
+  and for Gemini's second try whenever the donated route fails (~$0.01/run). On the donated key,
+  Gemini is BYOK on Metaculus's Google account: $0 to us, and its quota is shared with every bot.
 - `bot.alerts` mails the owner on every change of level (ok → low → empty → funded again) for each
   key, from the pollers themselves. Gmail SMTP on port 587: the box blocks 25 and 465.
 - `bot.notify` mails the owner when a tournament opens (the first new questions after a quiet day)

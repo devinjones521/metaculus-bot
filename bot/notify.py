@@ -101,6 +101,10 @@ def answers_email(
             note,
             *(f"   dropped: {reason[:200]}" for reason in result.run_errors),
             *(
+                f"   answered on the personal key after: {reason[:200]}"
+                for reason in result.fallbacks
+            ),
+            *(
                 [
                     f"   NO COMMENT POSTED: {result.comment_error[:200]}",
                     "   The forecast is in, but prizes need the reasoning, and no later",

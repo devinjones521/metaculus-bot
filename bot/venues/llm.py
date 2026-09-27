@@ -18,6 +18,15 @@ HOW IT COULD LIE
   `error` object (OpenRouter can return HTTP 200 with an error body). The
   caller decides whether a failed run is fatal; this module never converts
   failure into empty-string success.
+- **The provider's reason gets lost in the wrapper.** Google's "high demand"
+  arrives as HTTP 200 with the error inside the choice, and was logged as
+  "empty completion" 12 times during the 2026-09 warmup. Its quota 429s name the
+  exhausted quota only after ~300 characters of OpenRouter envelope, past where
+  the log cut them off. Both now read as the provider's own words.
+- **A completion cut off at max_tokens reads like an answer.** Gemini 3.5 Flash
+  spent 7,680 of 8,000 tokens thinking on 2026-09-27 and stopped mid-sentence,
+  and the binary parser falls back to the last bare "NN%" anywhere in the text.
+  A run that stopped on `finish_reason: length` is raised, not parsed.
 - **Cost runs away invisibly.** `key_limits()` exposes OpenRouter's
   `limit_remaining` so the orchestrator can log spend every run — the resources
   page's own recommendation. Budget enforcement lives with the caller.
@@ -28,6 +37,7 @@ HOW IT COULD LIE
 
 from __future__ import annotations
 
+import json
 import time
 from typing import Any
 
@@ -106,11 +116,21 @@ class OpenRouterClient:
             self.total_cost_usd += float(cost)
             self.cost_by_model[model] = self.cost_by_model.get(model, 0.0) + float(cost)
         try:
-            text = payload["choices"][0]["message"]["content"]
+            choice = payload["choices"][0]
+            text = choice["message"]["content"]
         except (KeyError, IndexError, TypeError) as exc:
             raise LlmError(f"{model}: malformed completion payload") from exc
+        if choice.get("error"):
+            error = choice["error"]
+            detail = error.get("message", error) if isinstance(error, dict) else error
+            code = error.get("code", "?") if isinstance(error, dict) else "?"
+            raise LlmError(f"{model}: provider error {code} in the completion: {detail}")
+        if choice.get("finish_reason") == "length":
+            raise LlmError(f"{model}: stopped at max_tokens={max_tokens} before finishing")
         if not text or not str(text).strip():
-            raise LlmError(f"{model}: empty completion")
+            raise LlmError(
+                f"{model}: empty completion (finish_reason={choice.get('finish_reason')})"
+            )
         return str(text)
 
     def models(self) -> set[str]:
@@ -155,5 +175,40 @@ class OpenRouterClient:
                 time.sleep(min(delay, 120.0))
                 response = self._http.post(f"{API}{path}", json=body)
         if response.status_code != httpx.codes.OK:
-            raise LlmError(f"HTTP {response.status_code}: {response.text[:300]}")
+            raise LlmError(describe_http_error(response))
         return response
+
+
+def describe_http_error(response: httpx.Response) -> str:
+    """A failed call in the provider's own words, with the part that names a
+    quota first, since the caller keeps only the first few hundred characters.
+
+    OpenRouter wraps a provider's error as `error.metadata.raw`, a JSON string
+    holding the provider's own `error.message`.
+    """
+    head = f"HTTP {response.status_code}"
+    try:
+        error = response.json().get("error") or {}
+    except ValueError:
+        return f"{head}: {response.text[:300]}"
+    if not isinstance(error, dict):
+        return f"{head}: {response.text[:300]}"
+    metadata = error.get("metadata") or {}
+    message = str(error.get("message") or "")
+    raw = metadata.get("raw") if isinstance(metadata, dict) else None
+    if isinstance(raw, str) and raw.strip():
+        try:
+            inner = json.loads(raw)
+        except ValueError:
+            inner = None
+        inner_error = inner.get("error") if isinstance(inner, dict) else None
+        if isinstance(inner_error, dict) and inner_error.get("message"):
+            message = str(inner_error["message"])
+        else:
+            message = raw
+    message = " ".join(message.split())
+    quota = message.find("Quota exceeded for metric")
+    if quota > 0:
+        message = message[quota:] + " — " + message[:quota].strip()
+    provider = metadata.get("provider_name") if isinstance(metadata, dict) else None
+    return f"{head}{f' from {provider}' if provider else ''}: {message[:400]}"

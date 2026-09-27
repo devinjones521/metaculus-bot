@@ -57,6 +57,17 @@ def test_the_answer_mail_names_each_question_its_answer_and_its_link() -> None:
     assert "4/5 models answered" in body and "HTTP 503" in body  # a thinned ensemble says so
 
 
+def test_an_answer_that_needed_the_second_route_says_so() -> None:
+    """A whole ensemble, but only because the personal key stepped in: the owner
+    pays for that route, so the mail says when it was used and why."""
+    rescued = _result(3, fallbacks=["google/x: HTTP 429 from Google AI Studio: Quota exceeded"])
+    mail = bn.answers_email("minibench", [rescued], NOW)
+    assert mail is not None
+    _, body = mail
+    assert "5/5 models answered" in body
+    assert "answered on the personal key after: google/x: HTTP 429" in body
+
+
 def test_a_sweep_that_did_nothing_mails_nothing() -> None:
     skipped = _result(1, submitted=False, error="skipped: already forecast")
     assert bn.answers_email("minibench", [skipped], NOW) is None
